@@ -8,6 +8,7 @@ locals {
   gold_schema_name           = "EDGARTOOLS_GOLD"
   refresh_warehouse_name     = "EDGARTOOLS_${upper(var.environment)}_REFRESH_WH"
   runtime_role_name          = "EDGARTOOLS_${upper(var.environment)}_REFRESHER"
+  refresher_user_name        = "EDGARTOOLS_${upper(var.environment)}_REFRESHER_USER"
   stage_name                 = "EDGARTOOLS_SOURCE_EXPORT_STAGE"
   file_format_name           = "EDGARTOOLS_SOURCE_EXPORT_FILE_FORMAT"
   status_table_name          = "SNOWFLAKE_REFRESH_STATUS"
@@ -58,21 +59,24 @@ locals {
       task_profile                 = local.task_profile_by_workflow.daily_incremental
       schedule_expression          = var.daily_incremental_schedule
       gold_affecting               = true
-      warehouse_command_expression = "States.Array('daily-incremental', '--run-id', $$.Execution.Name)"
+      # $.cik_list required until sec_tracked_universe seeding is implemented (Phase A step 1)
+      warehouse_command_expression = "States.Array('daily-incremental', '--run-id', $$.Execution.Name, '--cik-list', $.cik_list)"
       snowflake_command_expression = "States.Array('snowflake-sync-after-load', '--workflow-name', 'daily_incremental', '--run-id', $$.Execution.Name)"
     }
     bootstrap_recent_10 = {
       task_profile                 = local.task_profile_by_workflow.bootstrap_recent_10
       schedule_expression          = null
       gold_affecting               = true
-      warehouse_command_expression = "States.Array('bootstrap-recent-10', '--run-id', $$.Execution.Name)"
+      # $.cik_list required until sec_tracked_universe seeding is implemented (Phase A step 1)
+      warehouse_command_expression = "States.Array('bootstrap-recent-10', '--run-id', $$.Execution.Name, '--cik-list', $.cik_list)"
       snowflake_command_expression = "States.Array('snowflake-sync-after-load', '--workflow-name', 'bootstrap_recent_10', '--run-id', $$.Execution.Name)"
     }
     bootstrap_full = {
       task_profile                 = local.task_profile_by_workflow.bootstrap_full
       schedule_expression          = null
       gold_affecting               = true
-      warehouse_command_expression = "States.Array('bootstrap-full', '--run-id', $$.Execution.Name)"
+      # $.cik_list required until sec_tracked_universe seeding is implemented (Phase A step 1)
+      warehouse_command_expression = "States.Array('bootstrap-full', '--run-id', $$.Execution.Name, '--cik-list', $.cik_list)"
       snowflake_command_expression = "States.Array('snowflake-sync-after-load', '--workflow-name', 'bootstrap_full', '--run-id', $$.Execution.Name)"
     }
     targeted_resync = {
@@ -146,6 +150,13 @@ resource "aws_secretsmanager_secret" "edgar_identity" {
   tags = merge(local.tags, { Name = "${local.name_prefix}-edgar-identity" })
 }
 
+resource "aws_secretsmanager_secret_version" "edgar_identity" {
+  count = var.edgar_identity_secret_arn == null && var.edgar_identity_value != null ? 1 : 0
+
+  secret_id     = aws_secretsmanager_secret.edgar_identity[0].id
+  secret_string = var.edgar_identity_value
+}
+
 resource "aws_secretsmanager_secret" "snowflake_runtime" {
   count = var.snowflake_runtime_secret_arn == null ? 1 : 0
 
@@ -155,6 +166,24 @@ resource "aws_secretsmanager_secret" "snowflake_runtime" {
   kms_key_id              = var.snowflake_export_kms_key_arn
 
   tags = merge(local.tags, { Name = "${local.name_prefix}-snowflake-runtime" })
+}
+
+resource "aws_secretsmanager_secret" "snowflake_private_key" {
+  count = var.snowflake_private_key_secret_arn == null ? 1 : 0
+
+  name                    = "${local.name_prefix}-snowflake-private-key"
+  description             = "RSA private key for Snowflake key-pair authentication (WIF model) in ${var.environment}."
+  recovery_window_in_days = 0
+  kms_key_id              = var.snowflake_export_kms_key_arn
+
+  tags = merge(local.tags, { Name = "${local.name_prefix}-snowflake-private-key" })
+}
+
+resource "aws_secretsmanager_secret_version" "snowflake_private_key" {
+  count = var.snowflake_private_key_secret_arn == null && var.snowflake_private_key_pem != null ? 1 : 0
+
+  secret_id     = aws_secretsmanager_secret.snowflake_private_key[0].id
+  secret_string = var.snowflake_private_key_pem
 }
 
 resource "aws_secretsmanager_secret_version" "snowflake_runtime" {
@@ -168,6 +197,7 @@ resource "aws_secretsmanager_secret_version" "snowflake_runtime" {
     gold_schema           = local.gold_schema_name
     refresh_warehouse     = local.refresh_warehouse_name
     runtime_role          = local.runtime_role_name
+    refresher_user        = local.refresher_user_name
     storage_integration   = var.snowflake_storage_integration_name
     stage_name            = local.stage_name
     file_format_name      = local.file_format_name
@@ -197,6 +227,10 @@ locals {
   resolved_snowflake_runtime_secret_arn = coalesce(
     var.snowflake_runtime_secret_arn,
     try(aws_secretsmanager_secret.snowflake_runtime[0].arn, null),
+  )
+  resolved_snowflake_private_key_secret_arn = coalesce(
+    var.snowflake_private_key_secret_arn,
+    try(aws_secretsmanager_secret.snowflake_private_key[0].arn, null),
   )
 }
 
@@ -289,7 +323,10 @@ resource "aws_iam_role_policy" "ecs_task_execution_snowflake_secret" {
         Action = [
           "secretsmanager:GetSecretValue"
         ]
-        Resource = local.resolved_snowflake_runtime_secret_arn
+        Resource = [
+          local.resolved_snowflake_runtime_secret_arn,
+          local.resolved_snowflake_private_key_secret_arn,
+        ]
       },
       {
         Effect = "Allow"
@@ -491,6 +528,14 @@ resource "aws_ecs_task_definition" "warehouse" {
           {
             name  = "SNOWFLAKE_EXPORT_ROOT"
             value = local.snowflake_export_root
+          },
+          {
+            # Silver DuckDB must live on local container disk -- DuckDB cannot
+            # read/write S3 paths directly.  /tmp is always writable on Fargate
+            # and has 21 GB of ephemeral storage, which is more than enough for
+            # a single-run DuckDB file.
+            name  = "WAREHOUSE_SILVER_ROOT"
+            value = "/tmp/edgar-warehouse-silver"
           }
         ],
         var.warehouse_bronze_cik_limit == null ? [] : [
@@ -549,6 +594,10 @@ resource "aws_ecs_task_definition" "snowflake" {
         {
           name      = "SNOWFLAKE_RUNTIME_METADATA"
           valueFrom = local.resolved_snowflake_runtime_secret_arn
+        },
+        {
+          name      = "SNOWFLAKE_PRIVATE_KEY"
+          valueFrom = local.resolved_snowflake_private_key_secret_arn
         }
       ]
       logConfiguration = {
@@ -715,6 +764,70 @@ resource "aws_iam_role_policy" "scheduler_start_execution" {
           "states:StartExecution"
         ]
         Resource = [for workflow in aws_sfn_state_machine.workflow : workflow.arn]
+      }
+    ]
+  })
+}
+
+# ---------------------------------------------------------------------------
+# Runner IAM user — may start and monitor Step Functions executions and read
+# ECS task logs.  Must NOT have any infrastructure or S3 write permissions.
+# Separate from the Terraform deployer account by design.
+#
+# Access keys are created manually:
+#   aws iam create-access-key --user-name <runner-user-name>
+# then stored in Secrets Manager:
+#   secret name: <name_prefix>-runner-credentials
+#   format: {"aws_access_key_id":"...","aws_secret_access_key":"...","aws_region":"..."}
+# ---------------------------------------------------------------------------
+
+resource "aws_secretsmanager_secret" "runner_credentials" {
+  name                    = "${local.name_prefix}-runner-credentials"
+  description             = "AWS access key credentials for the ${local.name_prefix}-runner IAM user (Step Functions trigger only). Value set out-of-band after key creation."
+  recovery_window_in_days = 0
+
+  tags = merge(local.tags, { Name = "${local.name_prefix}-runner-credentials", Role = "runner" })
+}
+
+resource "aws_iam_user" "runner" {
+  name = "${local.name_prefix}-runner"
+  tags = merge(local.tags, { Name = "${local.name_prefix}-runner", Role = "runner" })
+}
+
+resource "aws_iam_user_policy" "runner" {
+  name = "${local.name_prefix}-runner"
+  user = aws_iam_user.runner.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "StartWorkflows"
+        Effect = "Allow"
+        Action = ["states:StartExecution"]
+        Resource = [for workflow in aws_sfn_state_machine.workflow : workflow.arn]
+      },
+      {
+        Sid    = "MonitorWorkflows"
+        Effect = "Allow"
+        Action = [
+          "states:DescribeExecution",
+          "states:GetExecutionHistory",
+          "states:DescribeStateMachine",
+          "states:ListExecutions",
+          "states:ListStateMachines"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "ReadTaskLogs"
+        Effect = "Allow"
+        Action = [
+          "logs:GetLogEvents",
+          "logs:FilterLogEvents",
+          "logs:DescribeLogStreams"
+        ]
+        Resource = "${aws_cloudwatch_log_group.ecs.arn}:*"
       }
     ]
   })

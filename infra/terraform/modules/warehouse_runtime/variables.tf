@@ -87,6 +87,13 @@ variable "edgar_identity_secret_arn" {
   default     = null
 }
 
+variable "edgar_identity_value" {
+  description = "EDGAR identity string to store in Secrets Manager (e.g. 'MyApp admin@example.com'). Only used when edgar_identity_secret_arn is null (Terraform manages the secret)."
+  type        = string
+  sensitive   = true
+  default     = null
+}
+
 variable "snowflake_runtime_secret_arn" {
   description = "Optional pre-existing Snowflake runtime metadata secret ARN."
   type        = string
@@ -96,6 +103,19 @@ variable "snowflake_runtime_secret_arn" {
 variable "snowflake_account_identifier" {
   description = "Snowflake account identifier used for WIF runtime metadata."
   type        = string
+  default     = null
+}
+
+variable "snowflake_private_key_secret_arn" {
+  description = "Optional pre-existing Secrets Manager ARN for the Snowflake RSA private key. When null, Terraform creates the secret."
+  type        = string
+  default     = null
+}
+
+variable "snowflake_private_key_pem" {
+  description = "PEM-encoded RSA private key for Snowflake key-pair authentication. Only used when snowflake_private_key_secret_arn is null (Terraform manages the secret). Populate after generating a key pair."
+  type        = string
+  sensitive   = true
   default     = null
 }
 
