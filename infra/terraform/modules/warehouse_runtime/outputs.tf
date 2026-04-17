@@ -23,6 +23,31 @@ output "snowflake_manifest_sns_topic_arn" {
   value       = aws_sns_topic.snowflake_manifest_events.arn
 }
 
+output "snowflake_storage_role_arn" {
+  description = "IAM role ARN that Snowflake assumes for native S3 export reads."
+  value       = try(aws_iam_role.snowflake_storage_reader[0].arn, null)
+}
+
+output "snowflake_export_root_url" {
+  description = "S3 URL prefix for Snowflake export packages, including the trailing slash required by the storage integration allow-list."
+  value       = local.snowflake_export_root_url
+}
+
+output "snowflake_export_prefix" {
+  description = "Bucket-relative prefix for Snowflake export packages."
+  value       = local.snowflake_export_prefix
+}
+
+output "snowflake_export_kms_key_arn" {
+  description = "KMS key ARN used to encrypt Snowflake export artifacts."
+  value       = var.snowflake_export_kms_key_arn
+}
+
+output "snowflake_manifest_subscriber_arn" {
+  description = "Snowflake-managed AWS principal ARN subscribed to manifest events."
+  value       = var.snowflake_manifest_subscriber_arn
+}
+
 output "state_machine_arns" {
   description = "State machine ARNs keyed by workflow."
   value       = { for name, workflow in aws_sfn_state_machine.workflow : name => workflow.arn }

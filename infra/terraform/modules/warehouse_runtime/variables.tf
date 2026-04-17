@@ -67,6 +67,12 @@ variable "snowflake_manifest_subscriber_arn" {
   default     = null
 }
 
+variable "snowflake_storage_external_id" {
+  description = "Optional external ID that Snowflake must present when assuming the Snowflake export reader IAM role."
+  type        = string
+  default     = null
+}
+
 variable "public_subnet_ids" {
   description = "Public subnet IDs for canonical warehouse ECS tasks."
   type        = list(string)

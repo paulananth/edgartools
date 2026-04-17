@@ -45,6 +45,7 @@ module "runtime" {
   snowflake_export_bucket_arn       = module.storage.snowflake_export_bucket_arn
   snowflake_export_kms_key_arn      = module.storage.snowflake_export_kms_key_arn
   snowflake_manifest_subscriber_arn = var.snowflake_manifest_subscriber_arn
+  snowflake_storage_external_id     = var.snowflake_storage_external_id
   public_subnet_ids                 = module.network.public_subnet_ids
   public_security_group_id          = module.network.public_ecs_security_group_id
   edgar_identity_secret_arn         = var.edgar_identity_secret_arn

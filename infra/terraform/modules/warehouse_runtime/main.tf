@@ -4,6 +4,8 @@ locals {
   name_prefix               = "edgartools-${var.environment}"
   container_name            = "edgar-warehouse"
   snowflake_export_root     = "s3://${var.snowflake_export_bucket_name}/warehouse/artifacts/snowflake_exports"
+  snowflake_export_root_url = "${local.snowflake_export_root}/"
+  snowflake_export_prefix   = "warehouse/artifacts/snowflake_exports/"
   snowflake_manifest_prefix = "warehouse/artifacts/snowflake_exports/manifests/"
   tags = merge(
     {
@@ -45,49 +47,53 @@ locals {
 
   workflows = {
     daily_incremental = {
-      task_profile        = local.task_profile_by_workflow.daily_incremental
-      schedule_expression = var.daily_incremental_schedule
-      gold_affecting      = true
-      # $.cik_list required until sec_tracked_universe seeding is implemented (Phase A step 1)
-      warehouse_command_expression = "States.Array('daily-incremental', '--run-id', $$.Execution.Name, '--cik-list', $.cik_list)"
+      task_profile                               = local.task_profile_by_workflow.daily_incremental
+      schedule_expression                        = var.daily_incremental_schedule
+      gold_affecting                             = true
+      warehouse_command_expression               = "States.Array('daily-incremental', '--run-id', $$.Execution.Name)"
+      warehouse_command_with_cik_list_expression = "States.Array('daily-incremental', '--run-id', $$.Execution.Name, '--cik-list', $.cik_list)"
     }
     bootstrap_recent_10 = {
-      task_profile        = local.task_profile_by_workflow.bootstrap_recent_10
-      schedule_expression = null
-      gold_affecting      = true
-      # $.cik_list required until sec_tracked_universe seeding is implemented (Phase A step 1)
-      warehouse_command_expression = "States.Array('bootstrap-recent-10', '--run-id', $$.Execution.Name, '--cik-list', $.cik_list)"
+      task_profile                               = local.task_profile_by_workflow.bootstrap_recent_10
+      schedule_expression                        = null
+      gold_affecting                             = true
+      warehouse_command_expression               = "States.Array('bootstrap-recent-10', '--run-id', $$.Execution.Name)"
+      warehouse_command_with_cik_list_expression = "States.Array('bootstrap-recent-10', '--run-id', $$.Execution.Name, '--cik-list', $.cik_list)"
     }
     bootstrap_full = {
-      task_profile        = local.task_profile_by_workflow.bootstrap_full
-      schedule_expression = null
-      gold_affecting      = true
-      # $.cik_list required until sec_tracked_universe seeding is implemented (Phase A step 1)
-      warehouse_command_expression = "States.Array('bootstrap-full', '--run-id', $$.Execution.Name, '--cik-list', $.cik_list)"
+      task_profile                               = local.task_profile_by_workflow.bootstrap_full
+      schedule_expression                        = null
+      gold_affecting                             = true
+      warehouse_command_expression               = "States.Array('bootstrap-full', '--run-id', $$.Execution.Name)"
+      warehouse_command_with_cik_list_expression = "States.Array('bootstrap-full', '--run-id', $$.Execution.Name, '--cik-list', $.cik_list)"
     }
     targeted_resync = {
-      task_profile                 = local.task_profile_by_workflow.targeted_resync
-      schedule_expression          = null
-      gold_affecting               = true
-      warehouse_command_expression = "States.Array('targeted-resync', '--scope-type', $.scope_type, '--scope-key', $.scope_key, '--run-id', $$.Execution.Name)"
+      task_profile                               = local.task_profile_by_workflow.targeted_resync
+      schedule_expression                        = null
+      gold_affecting                             = true
+      warehouse_command_expression               = "States.Array('targeted-resync', '--scope-type', $.scope_type, '--scope-key', $.scope_key, '--run-id', $$.Execution.Name)"
+      warehouse_command_with_cik_list_expression = null
     }
     full_reconcile = {
-      task_profile                 = local.task_profile_by_workflow.full_reconcile
-      schedule_expression          = var.full_reconcile_schedule
-      gold_affecting               = true
-      warehouse_command_expression = "States.Array('full-reconcile', '--run-id', $$.Execution.Name)"
+      task_profile                               = local.task_profile_by_workflow.full_reconcile
+      schedule_expression                        = var.full_reconcile_schedule
+      gold_affecting                             = true
+      warehouse_command_expression               = "States.Array('full-reconcile', '--run-id', $$.Execution.Name)"
+      warehouse_command_with_cik_list_expression = null
     }
     load_daily_form_index_for_date = {
-      task_profile                 = local.task_profile_by_workflow.load_daily_form_index_for_date
-      schedule_expression          = null
-      gold_affecting               = false
-      warehouse_command_expression = "States.Array('load-daily-form-index-for-date', $.target_date, '--run-id', $$.Execution.Name)"
+      task_profile                               = local.task_profile_by_workflow.load_daily_form_index_for_date
+      schedule_expression                        = null
+      gold_affecting                             = false
+      warehouse_command_expression               = "States.Array('load-daily-form-index-for-date', $.target_date, '--run-id', $$.Execution.Name)"
+      warehouse_command_with_cik_list_expression = null
     }
     catch_up_daily_form_index = {
-      task_profile                 = local.task_profile_by_workflow.catch_up_daily_form_index
-      schedule_expression          = null
-      gold_affecting               = false
-      warehouse_command_expression = "States.Array('catch-up-daily-form-index', '--run-id', $$.Execution.Name)"
+      task_profile                               = local.task_profile_by_workflow.catch_up_daily_form_index
+      schedule_expression                        = null
+      gold_affecting                             = false
+      warehouse_command_expression               = "States.Array('catch-up-daily-form-index', '--run-id', $$.Execution.Name)"
+      warehouse_command_with_cik_list_expression = null
     }
   }
 
@@ -179,6 +185,92 @@ resource "aws_s3_bucket_notification" "snowflake_manifest_events" {
   }
 
   depends_on = [aws_sns_topic_policy.snowflake_manifest_events]
+}
+
+resource "aws_iam_role" "snowflake_storage_reader" {
+  count = var.snowflake_manifest_subscriber_arn == null ? 0 : 1
+
+  name = "${local.name_prefix}-snowflake-s3"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      merge(
+        {
+          Effect = "Allow"
+          Principal = {
+            AWS = var.snowflake_manifest_subscriber_arn
+          }
+          Action = "sts:AssumeRole"
+        },
+        var.snowflake_storage_external_id == null ? {} : {
+          Condition = {
+            StringEquals = {
+              "sts:ExternalId" = var.snowflake_storage_external_id
+            }
+          }
+        }
+      )
+    ]
+  })
+
+  tags = merge(local.tags, { Name = "${local.name_prefix}-snowflake-s3", Role = "snowflake-storage-reader" })
+}
+
+resource "aws_iam_role_policy" "snowflake_storage_reader" {
+  count = length(aws_iam_role.snowflake_storage_reader) == 0 ? 0 : 1
+
+  name = "${local.name_prefix}-snowflake-export-s3-read"
+  role = aws_iam_role.snowflake_storage_reader[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "GetSnowflakeExportBucketLocation"
+        Effect = "Allow"
+        Action = [
+          "s3:GetBucketLocation"
+        ]
+        Resource = var.snowflake_export_bucket_arn
+      },
+      {
+        Sid    = "ListSnowflakeExportPrefix"
+        Effect = "Allow"
+        Action = [
+          "s3:ListBucket"
+        ]
+        Resource = var.snowflake_export_bucket_arn
+        Condition = {
+          StringLike = {
+            "s3:prefix" = [
+              local.snowflake_export_prefix,
+              "${local.snowflake_export_prefix}*"
+            ]
+          }
+        }
+      },
+      {
+        Sid    = "ReadSnowflakeExportObjects"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:GetObjectVersion"
+        ]
+        Resource = "${var.snowflake_export_bucket_arn}/${local.snowflake_export_prefix}*"
+      },
+      {
+        Sid    = "DecryptSnowflakeExportObjects"
+        Effect = "Allow"
+        Action = [
+          "kms:Decrypt",
+          "kms:DescribeKey",
+          "kms:GenerateDataKey"
+        ]
+        Resource = var.snowflake_export_kms_key_arn
+      }
+    ]
+  })
 }
 
 resource "aws_secretsmanager_secret" "edgar_identity" {
@@ -511,13 +603,21 @@ resource "aws_sfn_state_machine" "workflow" {
   name     = "${local.name_prefix}-${replace(each.key, "_", "-")}"
   role_arn = aws_iam_role.step_functions.arn
 
-  definition = templatefile("${path.module}/templates/ecs_run_task_single_step.asl.json.tmpl", {
+  definition = each.value.warehouse_command_with_cik_list_expression == null ? templatefile("${path.module}/templates/ecs_run_task_single_step.asl.json.tmpl", {
     cluster_arn                  = aws_ecs_cluster.warehouse.arn
     task_definition_arn          = aws_ecs_task_definition.warehouse[each.value.task_profile].arn
     container_name               = local.container_name
     warehouse_command_expression = each.value.warehouse_command_expression
     subnets_json                 = jsonencode(var.public_subnet_ids)
     security_groups_json         = jsonencode([var.public_security_group_id])
+    }) : templatefile("${path.module}/templates/ecs_run_task_optional_cik_list.asl.json.tmpl", {
+    cluster_arn                                = aws_ecs_cluster.warehouse.arn
+    task_definition_arn                        = aws_ecs_task_definition.warehouse[each.value.task_profile].arn
+    container_name                             = local.container_name
+    warehouse_command_expression               = each.value.warehouse_command_expression
+    warehouse_command_with_cik_list_expression = each.value.warehouse_command_with_cik_list_expression
+    subnets_json                               = jsonencode(var.public_subnet_ids)
+    security_groups_json                       = jsonencode([var.public_security_group_id])
   })
 
   logging_configuration {

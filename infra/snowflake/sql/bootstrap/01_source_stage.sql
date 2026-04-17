@@ -4,7 +4,9 @@
 --   set database_name = 'EDGARTOOLS_DEV';
 --   set source_schema_name = 'EDGARTOOLS_SOURCE';
 --   set deployer_role_name = 'EDGARTOOLS_DEV_DEPLOYER';
---   set storage_integration_name = 'EDGARTOOLS_DEV_S3_INTEGRATION';
+--   set storage_integration_name = 'EDGARTOOLS_DEV_EXPORT_INTEGRATION';
+--   set storage_role_arn = 'arn:aws:iam::123456789012:role/edgartools-dev-snowflake-s3';
+--   set storage_external_id = NULL;
 --   set export_root_url = 's3://edgartools-dev-snowflake-export/warehouse/artifacts/snowflake_exports/';
 --   set stage_name = 'EDGARTOOLS_SOURCE_EXPORT_STAGE';
 --   set parquet_file_format_name = 'EDGARTOOLS_SOURCE_EXPORT_FILE_FORMAT';
@@ -14,6 +16,34 @@
 --   set manifest_sns_topic_arn = 'arn:aws:sns:us-east-1:123456789012:edgartools-dev-snowflake-manifest-events';
 
 USE ROLE IDENTIFIER($deployer_role_name);
+
+BEGIN
+  EXECUTE IMMEDIATE
+    'CREATE STORAGE INTEGRATION IF NOT EXISTS ' || $storage_integration_name || '
+       TYPE = EXTERNAL_STAGE
+       STORAGE_PROVIDER = S3
+       ENABLED = TRUE
+       STORAGE_AWS_ROLE_ARN = ''' || $storage_role_arn || '''
+       STORAGE_ALLOWED_LOCATIONS = (''' || $export_root_url || ''')
+       COMMENT = ''EdgarTools native-pull storage integration.''';
+END;
+
+BEGIN
+  EXECUTE IMMEDIATE
+    'ALTER STORAGE INTEGRATION ' || $storage_integration_name || '
+       SET ENABLED = TRUE
+           STORAGE_AWS_ROLE_ARN = ''' || $storage_role_arn || '''
+           STORAGE_ALLOWED_LOCATIONS = (''' || $export_root_url || ''')';
+END;
+
+BEGIN
+  IF COALESCE($storage_external_id, '') <> '' THEN
+    EXECUTE IMMEDIATE
+      'ALTER STORAGE INTEGRATION ' || $storage_integration_name || '
+         SET STORAGE_AWS_EXTERNAL_ID = ''' || $storage_external_id || '''';
+  END IF;
+END;
+
 USE DATABASE IDENTIFIER($database_name);
 USE SCHEMA IDENTIFIER($source_schema_name);
 
@@ -30,6 +60,10 @@ CREATE STAGE IF NOT EXISTS IDENTIFIER($stage_name)
   URL = $export_root_url
   STORAGE_INTEGRATION = $storage_integration_name
   COMMENT = 'EdgarTools export stage used for Snowflake-native pull ingestion.';
+
+ALTER STAGE IDENTIFIER($stage_name)
+  SET URL = $export_root_url
+      STORAGE_INTEGRATION = $storage_integration_name;
 
 CREATE TABLE IF NOT EXISTS IDENTIFIER($manifest_inbox_table_name) (
   source_filename STRING NOT NULL,

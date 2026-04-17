@@ -38,6 +38,31 @@ output "snowflake_manifest_sns_topic_arn" {
   value       = module.runtime.snowflake_manifest_sns_topic_arn
 }
 
+output "snowflake_storage_role_arn" {
+  description = "Dev IAM role ARN that Snowflake assumes for native export reads."
+  value       = module.runtime.snowflake_storage_role_arn
+}
+
+output "snowflake_export_root_url" {
+  description = "Dev S3 URL prefix for Snowflake export packages."
+  value       = module.runtime.snowflake_export_root_url
+}
+
+output "snowflake_export_prefix" {
+  description = "Dev bucket-relative prefix for Snowflake export packages."
+  value       = module.runtime.snowflake_export_prefix
+}
+
+output "snowflake_export_kms_key_arn" {
+  description = "Dev KMS key ARN for Snowflake export artifacts."
+  value       = module.runtime.snowflake_export_kms_key_arn
+}
+
+output "snowflake_manifest_subscriber_arn" {
+  description = "Dev Snowflake-managed AWS principal ARN subscribed to manifest notifications."
+  value       = module.runtime.snowflake_manifest_subscriber_arn
+}
+
 output "runner_user_name" {
   description = "Dev runner IAM user name. Create access keys with: aws iam create-access-key --user-name <value>"
   value       = module.runtime.runner_user_name

@@ -335,8 +335,9 @@ For a full `dev` destroy/recreate or a first deployment in a new account, use th
 2. Build and publish the image to ECR, then verify the tag and digest exist.
 3. Update `container_image` in `terraform.tfvars` to the pushed digest.
 4. Re-apply the AWS account root so ECS task definitions reference the new digest.
-5. Bootstrap or refresh Snowflake-native pull objects with the current `snowflake_manifest_sns_topic_arn`.
-6. Only then trigger warehouse workflows.
+5. Bootstrap or refresh Snowflake-native pull objects to capture the current Snowflake storage external ID.
+6. Re-apply the AWS account root with `snowflake_storage_external_id` so the Snowflake storage-role trust and export-CMK permissions are complete.
+7. Rerun the Snowflake bootstrap validation path and only then trigger warehouse workflows.
 
 Do not destroy and recreate Snowflake pull objects against a stale SNS topic ARN from the previous AWS deployment.
 
@@ -397,15 +398,16 @@ Each state machine expects specific fields in the execution input JSON:
 
 | Workflow | Required input fields |
 |---|---|
-| `bootstrap_recent_10` | `{"cik_list": "320193,789019,..."}` — comma-separated CIK integers |
-| `bootstrap_full` | `{"cik_list": "320193,789019,..."}` — comma-separated CIK integers |
-| `daily_incremental` | `{"cik_list": "320193,789019,..."}` — comma-separated CIK integers |
+| `bootstrap_recent_10` | none required; optional `{"cik_list": "320193,789019,..."}` override |
+| `bootstrap_full` | none required; optional `{"cik_list": "320193,789019,..."}` override |
+| `daily_incremental` | none required; optional `{"cik_list": "320193,789019,..."}` override |
 | `load_daily_form_index_for_date` | `{"target_date": "YYYY-MM-DD"}` |
 | `targeted_resync` | `{"scope_type": "<type>", "scope_key": "<key>"}` |
 | `catch_up_daily_form_index` | none required |
 | `full_reconcile` | none required |
 
-> **Note**: `cik_list` is required for bootstrap and incremental workflows until `silver.sec_tracked_universe` is seeded from `company_tickers_exchange.json`. Once Phase A step 1 is complete, `cik_list` will become optional (the tracked universe provides the default set).
+`bootstrap_recent_10`, `bootstrap_full`, and `daily_incremental` now default to the seeded
+tracked universe when `cik_list` is omitted.
 
 Example trigger using runner credentials from Secrets Manager:
 
@@ -464,9 +466,16 @@ aws secretsmanager put-secret-value \
 
 ### Snowflake manifest topic handoff
 
-After apply, capture the `snowflake_manifest_sns_topic_arn` output from the AWS account root.
-Pass that ARN into the Snowflake bootstrap session as `manifest_sns_topic_arn` so Snowpipe can
-subscribe to manifest notifications from the export bucket.
+After apply, capture these AWS account-root outputs:
+
+- `snowflake_manifest_sns_topic_arn`
+- `snowflake_storage_role_arn`
+- `snowflake_export_root_url`
+- `snowflake_export_kms_key_arn`
+
+Run the Snowflake bootstrap driver with those outputs. It emits `snowflake_storage_external_id`,
+which must be written back into AWS Terraform before the Snowflake storage role can assume the
+bucket and CMK reader path end to end.
 
 ## Validation
 
@@ -484,6 +493,8 @@ Runtime checks in `dev`:
 - confirm bronze objects land only in the bronze bucket under `warehouse/bronze/submissions/sec/cik=<cik>/...`
 - confirm Snowflake export Parquet files land in the export bucket under `warehouse/artifacts/snowflake_exports/<table>/...`
 - confirm final Snowflake run manifests land in the export bucket under `warehouse/artifacts/snowflake_exports/manifests/...`
-- check CloudWatch log output for `silver_table_counts` — expect `sec_company=3`, `sec_company_filing=30` (10 × 3 companies) for the three test CIKs
+- confirm `LIST @EDGARTOOLS_SOURCE.EDGARTOOLS_SOURCE_EXPORT_STAGE/manifests/` succeeds
+- confirm `COPY_HISTORY` for `EDGARTOOLS_SOURCE.SNOWFLAKE_RUN_MANIFEST_INBOX` shows `STATUS = 'Loaded'`
+- check CloudWatch log output for `silver_table_counts` - expect `sec_company=3`, `sec_company_filing=30` (10 x 3 companies) for the three test CIKs
 - confirm failed Step Functions executions appear in CloudWatch alarms
 - trigger `load-daily-form-index-for-date` with `{"target_date": "YYYY-MM-DD"}` for a known business date and confirm `sec_daily_index_checkpoint` checkpoint appears in the silver layer log output

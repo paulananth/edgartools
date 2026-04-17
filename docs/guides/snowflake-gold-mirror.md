@@ -21,7 +21,7 @@ Snowflake is a downstream gold mirror, not the canonical warehouse.
 ## Preferred build order
 
 1. Terraform baseline platform objects
-2. SnowCLI bootstrap SQL for storage integration, stage, manifest inbox, status table, source-load procedure, and triggered task
+2. SnowCLI bootstrap for the storage integration, stage, manifest inbox, status table, source-load procedure, and triggered task
 3. dbt deployment of business-facing gold models and dynamic tables
 4. AWS runtime cutover from infrastructure validation to real Snowflake-native pull after export completion
 
@@ -44,6 +44,7 @@ Baseline object names:
 
 Bootstrap object names:
 
+- storage integration: `EDGARTOOLS_<ENV>_EXPORT_INTEGRATION`
 - stage: `EDGARTOOLS_SOURCE_EXPORT_STAGE`
 - Parquet file format: `EDGARTOOLS_SOURCE_EXPORT_FILE_FORMAT`
 - manifest file format: `EDGARTOOLS_SOURCE_RUN_MANIFEST_FILE_FORMAT`
@@ -54,6 +55,18 @@ Bootstrap object names:
 - status table: `EDGARTOOLS_SOURCE.SNOWFLAKE_REFRESH_STATUS`
 - source load procedure: `EDGARTOOLS_SOURCE.LOAD_EXPORTS_FOR_RUN`
 - refresh procedure: `EDGARTOOLS_GOLD.REFRESH_AFTER_LOAD`
+
+dbt gold object names:
+
+- `EDGARTOOLS_GOLD.COMPANY`
+- `EDGARTOOLS_GOLD.FILING_ACTIVITY`
+- `EDGARTOOLS_GOLD.OWNERSHIP_ACTIVITY`
+- `EDGARTOOLS_GOLD.OWNERSHIP_HOLDINGS`
+- `EDGARTOOLS_GOLD.ADVISER_OFFICES`
+- `EDGARTOOLS_GOLD.ADVISER_DISCLOSURES`
+- `EDGARTOOLS_GOLD.PRIVATE_FUNDS`
+- `EDGARTOOLS_GOLD.FILING_DETAIL`
+- `EDGARTOOLS_GOLD.EDGARTOOLS_GOLD_STATUS`
 
 ## Native Pull
 
@@ -80,7 +93,8 @@ The manifest-triggered Snowflake task calls two stable SQL procedures:
 - `CALL EDGARTOOLS_GOLD.REFRESH_AFTER_LOAD(workflow_name, run_id)`
 
 The first call handles Snowflake-side source registration and import logic.
-The second call remains the single public refresh wrapper for downstream gold freshness.
+The second call remains the single public refresh wrapper for downstream gold freshness and
+must not mark a run successful until all dbt-owned dynamic tables have refreshed successfully.
 
 ## dbt ownership
 
@@ -92,3 +106,23 @@ dbt owns:
 - tests on business-facing objects
 
 Terraform and SnowCLI do not own ongoing gold-model evolution.
+
+## Bootstrap driver
+
+The preferred operator path is the SnowCLI bootstrap driver:
+
+```bash
+uv run python infra/snowflake/sql/bootstrap_native_pull.py \
+  --aws-root infra/terraform/accounts/dev \
+  --snowflake-root infra/terraform/snowflake/accounts/dev \
+  --connection snowconn \
+  --artifact-path infra/snowflake/sql/dev_native_pull_handshake.json
+```
+
+It performs the two-pass handshake:
+
+1. reads AWS and Snowflake Terraform outputs
+2. creates or updates the storage integration, stage, pipe, procedures, and task
+3. captures `DESC INTEGRATION`
+4. emits `snowflake_storage_external_id` for the AWS Terraform re-apply
+5. reruns with `--storage-external-id` and `--validate-native-pull` after the AWS trust and KMS update
