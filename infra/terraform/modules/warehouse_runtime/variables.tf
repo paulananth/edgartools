@@ -141,6 +141,12 @@ variable "runner_user_force_destroy" {
   default     = false
 }
 
+variable "bootstrap_batch_concurrency" {
+  description = "Maximum number of concurrent bootstrap-batch ECS tasks in the Distributed Map workflow."
+  type        = number
+  default     = 10
+}
+
 variable "tags" {
   description = "Additional tags applied to runtime resources."
   type        = map(string)

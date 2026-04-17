@@ -20,6 +20,7 @@ import httpx
 from edgar_warehouse.artifacts import fetch_filing_artifacts
 from edgar_warehouse.gold import build_gold, write_gold_to_snowflake_export, write_gold_to_storage
 from edgar_warehouse.loaders import (
+    seed_universe_loader,
     stage_address_loader,
     stage_company_loader,
     stage_daily_index_filing_loader,
@@ -40,6 +41,7 @@ from edgar_warehouse.text_extraction import extract_text_for_accession
 GOLD_AFFECTING_COMMANDS = {
     "bootstrap-full",
     "bootstrap-recent-10",
+    "bootstrap-batch",
     "daily-incremental",
     "targeted-resync",
     "full-reconcile",
@@ -429,6 +431,8 @@ def _execute_warehouse_bronze_capture(
         "started_at": now.isoformat().replace("+00:00", "Z"),
         "status": "ok",
         "writes": writes,
+        "cik_universe_path": metrics.get("cik_universe_path"),
+        "cik_count": metrics.get("cik_count"),
     }
 
 
@@ -756,6 +760,57 @@ def _capture_bronze_raw(
             metrics["sync_status"] = "partial"
         return raw_writes, metrics
 
+    if command_name == "seed-universe":
+        reference_result = _sync_reference_data(
+            context=context,
+            db=db,
+            sync_run_id=sync_run_id,
+            fetch_date=now.date(),
+        )
+        raw_writes.extend(reference_result["raw_writes"])
+        metrics["rows_inserted"] += reference_result["rows_written"]
+        metrics["rows_skipped"] += reference_result["rows_skipped"]
+        seed_document = reference_result.get("seed_document") or {}
+        universe_rows = seed_universe_loader(
+            seed_document,
+            sync_run_id=sync_run_id,
+            raw_object_id=reference_result["raw_writes"][0]["sha256"] if reference_result["raw_writes"] else "",
+            load_mode="seed_universe",
+        )
+        limited_ciks = _apply_bronze_cik_limit([int(row["cik"]) for row in universe_rows])
+        if len(limited_ciks) < len(universe_rows):
+            allowed = set(limited_ciks)
+            universe_rows = [row for row in universe_rows if int(row["cik"]) in allowed]
+        cik_universe_path = _write_cik_universe_batches(
+            context=context,
+            rows=universe_rows,
+            fetch_date=now.date(),
+            sync_run_id=sync_run_id,
+            batch_size=100,
+        )
+        metrics["cik_universe_path"] = cik_universe_path
+        metrics["cik_count"] = len(universe_rows)
+        return raw_writes, metrics
+
+    if command_name == "bootstrap-batch":
+        cik_list = list(arguments.get("cik_list") or [])
+        include_pagination = bool(arguments.get("include_pagination", True))
+        for cik in cik_list:
+            result = submissions_orchestrator(
+                context=context,
+                db=db,
+                sync_run_id=sync_run_id,
+                cik=cik,
+                include_pagination=include_pagination,
+                fetch_date=now.date(),
+                force=bool(arguments.get("force", False)),
+                load_mode="bootstrap_batch",
+            )
+            raw_writes.extend(result["raw_writes"])
+            metrics["rows_inserted"] += result["rows_written"]
+            metrics["rows_skipped"] += result["rows_skipped"]
+        return raw_writes, metrics
+
     raise WarehouseRuntimeError(f"bronze_capture mode does not support {command_name}")
 
 
@@ -984,7 +1039,39 @@ def _sync_reference_data(
 
     if seed_document is not None:
         db.seed_tracked_universe(seed_document)
-    return {"raw_writes": raw_writes, "rows_written": rows_written, "rows_skipped": rows_skipped}
+    return {
+        "raw_writes": raw_writes,
+        "rows_written": rows_written,
+        "rows_skipped": rows_skipped,
+        "seed_document": seed_document,
+    }
+
+
+def _write_cik_universe_batches(
+    context: WarehouseCommandContext,
+    rows: list[dict[str, Any]],
+    fetch_date: date,
+    sync_run_id: str,
+    batch_size: int = 100,
+) -> str:
+    """Write the CIK universe as pre-batched JSON Lines to the bronze root.
+
+    Each line is {"cik_list": "cik1,cik2,..."} for use by the Distributed Map
+    bootstrap-batch iterator.
+
+    Path uses run_id only (no date component) so the Step Function can construct
+    the key deterministically from $$.Execution.Name without date extraction.
+
+    Returns the full S3/local path to the JSON Lines file.
+    """
+    relative_path = f"reference/cik_universe/runs/{sync_run_id}/cik_batches.jsonl"
+    lines = []
+    ciks = [str(row["cik"]) for row in rows]
+    for i in range(0, len(ciks), batch_size):
+        batch = ciks[i : i + batch_size]
+        lines.append(json.dumps({"cik_list": ",".join(batch)}))
+    content = "\n".join(lines) + ("\n" if lines else "")
+    return context.bronze_root.write_text(relative_path, content)
 
 
 def _reference_sources_for_scope(scope_key: str) -> list[str]:
@@ -1800,7 +1887,7 @@ def _date_range(start: date, end: date) -> list[date]:
 
 
 def _sync_mode_for_command(command_name: str) -> str:
-    if command_name in {"bootstrap-full", "bootstrap-recent-10"}:
+    if command_name in {"bootstrap-full", "bootstrap-recent-10", "bootstrap-batch"}:
         return "bootstrap"
     if command_name in {"daily-incremental", "load-daily-form-index-for-date", "catch-up-daily-form-index"}:
         return "incremental"
@@ -1808,14 +1895,18 @@ def _sync_mode_for_command(command_name: str) -> str:
         return "resync"
     if command_name == "full-reconcile":
         return "reconcile"
+    if command_name == "seed-universe":
+        return "incremental"
     return "incremental"
 
 
 def _sync_scope_type_for_command(command_name: str, scope: dict[str, Any]) -> str:
     if command_name in {"daily-incremental", "load-daily-form-index-for-date", "catch-up-daily-form-index"}:
         return "daily_index"
-    if command_name in {"bootstrap-full", "bootstrap-recent-10"}:
+    if command_name in {"bootstrap-full", "bootstrap-recent-10", "bootstrap-batch"}:
         return "submissions"
+    if command_name == "seed-universe":
+        return "reference"
     if command_name == "targeted-resync":
         scope_type = str(scope.get("scope_type", "")).strip()
         if scope_type == "cik":
@@ -1838,6 +1929,11 @@ def _sync_scope_key_for_command(command_name: str, scope: dict[str, Any]) -> str
     if command_name == "targeted-resync":
         return str(scope.get("scope_key") or "")
     if command_name == "full-reconcile":
+        cik_list = scope.get("cik_list") or []
+        return ",".join(str(value) for value in cik_list) or None
+    if command_name == "seed-universe":
+        return "company_tickers_exchange"
+    if command_name == "bootstrap-batch":
         cik_list = scope.get("cik_list") or []
         return ",".join(str(value) for value in cik_list) or None
     cik_list = scope.get("cik_list") or []
@@ -1910,6 +2006,15 @@ def _resolve_scope(
             "sample_limit": arguments.get("sample_limit"),
         }
 
+    if command_name == "seed-universe":
+        return {"run_date": now.date().isoformat()}
+
+    if command_name == "bootstrap-batch":
+        return {
+            "cik_list": arguments.get("cik_list") or [],
+            "include_pagination": arguments.get("include_pagination", True),
+        }
+
     raise WarehouseRuntimeError(f"Unsupported warehouse command: {command_name}")
 
 
@@ -1920,11 +2025,18 @@ def _planned_writes(command_name: str, command_path: str, run_id: str, scope: di
         "staging": f"staging/runs/{command_path}/{run_id}/manifest.json",
     }
 
-    if command_name in {"bootstrap-recent-10", "bootstrap-full", "daily-incremental", "targeted-resync", "full-reconcile"}:
+    if command_name in {"bootstrap-recent-10", "bootstrap-full", "bootstrap-batch", "daily-incremental", "targeted-resync", "full-reconcile"}:
         shared["silver"] = f"silver/sec/runs/{command_path}/{run_id}/manifest.json"
         shared["gold"] = f"gold/runs/{command_path}/{run_id}/manifest.json"
         shared["bronze"] = bronze_rel
         return {key: shared[key] for key in ("bronze", "staging", "silver", "gold", "artifacts")}
+
+    if command_name == "seed-universe":
+        return {
+            "bronze": bronze_rel,
+            "staging": shared["staging"],
+            "artifacts": shared["artifacts"],
+        }
 
     if command_name == "load-daily-form-index-for-date":
         target_date = scope["target_date"]

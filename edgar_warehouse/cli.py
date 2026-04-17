@@ -97,6 +97,14 @@ def _handle_full_reconcile(args: argparse.Namespace) -> int:
     return run_command("full-reconcile", args)
 
 
+def _handle_seed_universe(args: argparse.Namespace) -> int:
+    return run_command("seed-universe", args)
+
+
+def _handle_bootstrap_batch(args: argparse.Namespace) -> int:
+    return run_command("bootstrap-batch", args)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="edgar-warehouse",
@@ -263,6 +271,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_run_id_arg(full_reconcile)
     full_reconcile.set_defaults(handler=_handle_full_reconcile)
+
+    seed_universe = subparsers.add_parser(
+        "seed-universe",
+        help="Fetch company_tickers_exchange.json and write CIK universe to S3 as pre-batched JSON Lines.",
+    )
+    _add_run_id_arg(seed_universe)
+    seed_universe.set_defaults(handler=_handle_seed_universe)
+
+    bootstrap_batch = subparsers.add_parser(
+        "bootstrap-batch",
+        help="Bootstrap a specific batch of CIKs (one Distributed Map iteration).",
+    )
+    bootstrap_batch.add_argument(
+        "--cik-list",
+        type=_parse_cik_list,
+        required=True,
+        help="Comma-separated CIK integers for this batch",
+    )
+    bootstrap_batch.add_argument(
+        "--include-pagination",
+        dest="include_pagination",
+        action="store_true",
+        default=True,
+        help="Fetch full filing history including pagination files",
+    )
+    bootstrap_batch.add_argument(
+        "--no-include-pagination",
+        dest="include_pagination",
+        action="store_false",
+        help="Skip pagination files (recent filings only)",
+    )
+    _add_run_id_arg(bootstrap_batch)
+    bootstrap_batch.set_defaults(handler=_handle_bootstrap_batch)
 
     return parser
 
