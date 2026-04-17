@@ -1,6 +1,6 @@
 # EdgarTools Snowflake dbt Project
 
-This is the dbt scaffold for the Snowflake gold mirror.
+This project owns the business-facing Snowflake gold mirror.
 
 ## Ownership
 
@@ -16,9 +16,20 @@ It does not own:
 - Snowflake platform objects created by Terraform
 - storage integrations, stages, or procedures created by SnowCLI bootstrap SQL
 
-## Initial scope
+## Current scope
 
-The initial scaffold only publishes `EDGARTOOLS_GOLD_STATUS`.
+The project publishes these objects in `EDGARTOOLS_GOLD`:
 
-Add business-facing tables such as `COMPANY` and `FILING_ACTIVITY` here once the source-side
-Snowflake table contracts are fixed.
+- `COMPANY`
+- `FILING_ACTIVITY`
+- `OWNERSHIP_ACTIVITY`
+- `OWNERSHIP_HOLDINGS`
+- `ADVISER_OFFICES`
+- `ADVISER_DISCLOSURES`
+- `PRIVATE_FUNDS`
+- `FILING_DETAIL`
+- `EDGARTOOLS_GOLD_STATUS`
+
+All eight business tables are dbt-managed Snowflake dynamic tables with `TARGET_LAG = DOWNSTREAM`.
+The Snowflake bootstrap wrapper triggers and waits for these dynamic tables before marking a run
+successful in `EDGARTOOLS_SOURCE.SNOWFLAKE_REFRESH_STATUS`.

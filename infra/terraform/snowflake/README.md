@@ -35,18 +35,20 @@ They do not provision:
 - dbt models
 - users or workload identity federation bindings
 
-Those remain separate follow-on steps because they require additional security and platform
-decisions beyond the database and role baseline.
+Those remain separate on purpose:
+
+- SnowCLI bootstrap owns the native-pull ingestion contract
+- dbt owns the business-facing gold mirror
+- AWS Terraform owns the export bucket, SNS topic, and IAM role that Snowflake assumes
 
 ## Preferred Build Order
 
 The preferred Snowflake E2E path is:
 
 1. baseline platform objects from Terraform
-2. storage integration, stage, and file format
-3. source-side load procedure and public refresh wrapper
+2. SnowCLI bootstrap for the storage integration, stage, file formats, source-side load procedure, and public refresh wrapper
 4. dbt deployment of business-facing gold models and dynamic tables
-5. AWS runtime cutover from infrastructure-validation mode to real Snowflake import and refresh
+5. AWS runtime cutover from infrastructure-validation mode to real Snowflake-native pull
 
 This keeps the canonical warehouse independent from Snowflake while still giving Snowflake a stable
 gold-serving contract.

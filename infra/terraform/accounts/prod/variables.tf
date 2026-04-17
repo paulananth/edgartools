@@ -53,39 +53,14 @@ variable "edgar_identity_value" {
   default     = null
 }
 
-variable "snowflake_runtime_secret_arn" {
-  description = "Deprecated compatibility input for the retired AWS-managed Snowflake sync runner."
-  type        = string
-  default     = null
-}
-
-variable "snowflake_account_identifier" {
-  description = "Deprecated compatibility input; Snowflake account bootstrap now happens outside the AWS runtime root."
-  type        = string
-  default     = null
-}
-
-variable "snowflake_private_key_secret_arn" {
-  description = "Deprecated compatibility input for the retired AWS-managed Snowflake sync runner."
-  type        = string
-  default     = null
-}
-
-variable "snowflake_private_key_pem" {
-  description = "Deprecated compatibility input for the retired AWS-managed Snowflake sync runner."
-  type        = string
-  sensitive   = true
-  default     = null
-}
-
-variable "snowflake_storage_integration_name" {
-  description = "Deprecated compatibility input; Snowflake import path bootstrap now lives in Snowflake tooling."
-  type        = string
-  default     = null
-}
-
 variable "snowflake_manifest_subscriber_arn" {
   description = "Optional Snowflake-managed AWS principal ARN allowed to subscribe to the manifest SNS topic for Snowpipe auto-ingest."
+  type        = string
+  default     = null
+}
+
+variable "snowflake_storage_external_id" {
+  description = "Optional external ID that Snowflake must present when assuming the Snowflake S3 reader role."
   type        = string
   default     = null
 }
@@ -139,12 +114,6 @@ variable "task_profile_by_workflow" {
   description = "Task profile name for each workflow."
   type        = map(string)
   default     = {}
-}
-
-variable "snowflake_task_profile_name" {
-  description = "Deprecated compatibility input for the retired AWS-managed Snowflake sync runner."
-  type        = string
-  default     = "small"
 }
 
 variable "tags" {

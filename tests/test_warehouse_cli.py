@@ -9,26 +9,6 @@ import pytest
 import edgar_warehouse.runtime as warehouse_runtime
 from edgar_warehouse.cli import main
 
-
-def _snowflake_runtime_metadata() -> str:
-    return json.dumps(
-        {
-            "account": "acme-account",
-            "database": "EDGARTOOLS_DEV",
-            "source_schema": "EDGARTOOLS_SOURCE",
-            "gold_schema": "EDGARTOOLS_GOLD",
-            "refresh_warehouse": "EDGARTOOLS_DEV_REFRESH_WH",
-            "runtime_role": "EDGARTOOLS_DEV_REFRESHER",
-            "storage_integration": "EDGARTOOLS_DEV_S3_INTEGRATION",
-            "stage_name": "EDGARTOOLS_SOURCE_EXPORT_STAGE",
-            "file_format_name": "EDGARTOOLS_SOURCE_EXPORT_FILE_FORMAT",
-            "status_table_name": "SNOWFLAKE_REFRESH_STATUS",
-            "source_load_procedure": "EDGARTOOLS_SOURCE.LOAD_EXPORTS_FOR_RUN",
-            "refresh_procedure": "EDGARTOOLS_GOLD.REFRESH_AFTER_LOAD",
-        }
-    )
-
-
 @pytest.fixture
 def workspace_tmp_dir():
     base_dir = Path(tempfile.gettempdir()) / "ew-warehouse-tests"
@@ -53,7 +33,6 @@ def workspace_tmp_dir():
         ["catch-up-daily-form-index", "--help"],
         ["targeted-resync", "--help"],
         ["full-reconcile", "--help"],
-        ["snowflake-sync-after-load", "--help"],
     ],
 )
 def test_warehouse_cli_help(argv, capsys):
@@ -184,56 +163,6 @@ def test_gold_affecting_commands_require_snowflake_export_root(capsys, monkeypat
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "error"
     assert "SNOWFLAKE_EXPORT_ROOT" in payload["message"]
-
-
-@pytest.mark.fast
-def test_snowflake_sync_after_load_validates_runtime_metadata(capsys, monkeypatch, workspace_tmp_dir):
-    snowflake_export_root = workspace_tmp_dir / "snowflake-export-root"
-
-    monkeypatch.setenv("SNOWFLAKE_EXPORT_ROOT", str(snowflake_export_root))
-    monkeypatch.setenv("SNOWFLAKE_RUNTIME_METADATA", _snowflake_runtime_metadata())
-
-    exit_code = main(
-        [
-            "snowflake-sync-after-load",
-            "--workflow-name",
-            "daily_incremental",
-            "--run-id",
-            "snowflake-sync-run",
-        ]
-    )
-
-    assert exit_code == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["status"] == "ok"
-    assert payload["snowflake"]["database"] == "EDGARTOOLS_DEV"
-    assert payload["snowflake"]["runtime_role"] == "EDGARTOOLS_DEV_REFRESHER"
-    assert payload["snowflake"]["file_format_name"] == "EDGARTOOLS_SOURCE_EXPORT_FILE_FORMAT"
-    assert payload["source_load_call"] == "CALL EDGARTOOLS_SOURCE.LOAD_EXPORTS_FOR_RUN('daily_incremental', 'snowflake-sync-run')"
-    assert payload["refresh_call"] == "CALL EDGARTOOLS_GOLD.REFRESH_AFTER_LOAD('daily_incremental', 'snowflake-sync-run')"
-
-
-@pytest.mark.fast
-def test_snowflake_sync_after_load_rejects_credential_material(capsys, monkeypatch, workspace_tmp_dir):
-    snowflake_export_root = workspace_tmp_dir / "snowflake-export-root"
-    metadata = json.loads(_snowflake_runtime_metadata())
-    metadata["password"] = "not-allowed"
-
-    monkeypatch.setenv("SNOWFLAKE_EXPORT_ROOT", str(snowflake_export_root))
-    monkeypatch.setenv("SNOWFLAKE_RUNTIME_METADATA", json.dumps(metadata))
-
-    exit_code = main(
-        [
-            "snowflake-sync-after-load",
-            "--workflow-name",
-            "daily_incremental",
-        ]
-    )
-
-    assert exit_code == 2
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["status"] == "error"
-    assert "credential material" in payload["message"]
 
 
 @pytest.mark.fast

@@ -2,4 +2,8 @@ container_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/edgartools-dev-w
 warehouse_runtime_mode = "bronze_capture"
 warehouse_bronze_cik_limit = 10
 
+# Optional after the Snowflake integration handshake:
+# snowflake_manifest_subscriber_arn = "arn:aws:iam::247332612486:user/example"
+# snowflake_storage_external_id = "replace-me-after-bootstrap"
+
 edgar_identity_value = "Your Name your.email@example.com"
