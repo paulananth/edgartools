@@ -1,5 +1,6 @@
 import json
 import shutil
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -30,7 +31,7 @@ def _snowflake_runtime_metadata() -> str:
 
 @pytest.fixture
 def workspace_tmp_dir():
-    base_dir = Path.cwd() / ".tmp-warehouse-tests"
+    base_dir = Path(tempfile.gettempdir()) / "ew-warehouse-tests"
     base_dir.mkdir(parents=True, exist_ok=True)
     temp_dir = base_dir / f"run-{uuid.uuid4().hex}"
     temp_dir.mkdir(parents=True, exist_ok=True)
@@ -285,7 +286,7 @@ def test_bronze_capture_daily_incremental_writes_reference_and_daily_index_raw_o
     monkeypatch.setenv("WAREHOUSE_STORAGE_ROOT", str(warehouse_root))
     monkeypatch.setenv("SNOWFLAKE_EXPORT_ROOT", str(snowflake_export_root))
 
-    exit_code = main(["daily-incremental", "--start-date", "2026-04-10", "--include-reference-refresh"])
+    exit_code = main(["daily-incremental", "--start-date", "2026-04-10", "--end-date", "2026-04-10", "--include-reference-refresh"])
 
     assert exit_code == 0
     payload = json.loads(capsys.readouterr().out)

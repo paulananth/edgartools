@@ -1,5 +1,6 @@
 import json
 import shutil
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -14,7 +15,7 @@ from tests.warehouse_result_helpers import report_duckdb_table
 
 @pytest.fixture
 def workspace_tmp_dir():
-    base_dir = Path.cwd() / ".tmp-warehouse-tests"
+    base_dir = Path(tempfile.gettempdir()) / "ew-warehouse-tests"
     base_dir.mkdir(parents=True, exist_ok=True)
     temp_dir = base_dir / f"run-{uuid.uuid4().hex}"
     temp_dir.mkdir(parents=True, exist_ok=True)

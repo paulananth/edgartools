@@ -3,8 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import sys
 
 from edgar_warehouse.runtime import run_command
+
+_SNOWFLAKE_CREDENTIAL_KEYS: frozenset[str] = frozenset(
+    {"password", "private_key", "private_key_pem", "token", "passcode"}
+)
 
 
 def _parse_cik_list(value: str) -> list[int]:
@@ -95,6 +102,47 @@ def _handle_targeted_resync(args: argparse.Namespace) -> int:
 
 def _handle_full_reconcile(args: argparse.Namespace) -> int:
     return run_command("full-reconcile", args)
+
+
+def _handle_snowflake_sync_after_load(args: argparse.Namespace) -> int:
+    raw_metadata = os.environ.get("SNOWFLAKE_RUNTIME_METADATA", "")
+    if not raw_metadata:
+        result = {"status": "error", "message": "SNOWFLAKE_RUNTIME_METADATA environment variable is not set"}
+        sys.stdout.write(json.dumps(result) + "\n")
+        return 2
+
+    try:
+        metadata = json.loads(raw_metadata)
+    except json.JSONDecodeError as exc:
+        result = {"status": "error", "message": f"SNOWFLAKE_RUNTIME_METADATA is not valid JSON: {exc}"}
+        sys.stdout.write(json.dumps(result) + "\n")
+        return 2
+
+    credential_keys = sorted(k for k in metadata if k in _SNOWFLAKE_CREDENTIAL_KEYS)
+    if credential_keys:
+        result = {
+            "status": "error",
+            "message": f"SNOWFLAKE_RUNTIME_METADATA contains credential material: {', '.join(credential_keys)}",
+        }
+        sys.stdout.write(json.dumps(result) + "\n")
+        return 2
+
+    workflow_name = args.workflow_name
+    run_id = getattr(args, "run_id", None) or ""
+    source_load_procedure = metadata.get("source_load_procedure", "")
+    refresh_procedure = metadata.get("refresh_procedure", "")
+
+    result = {
+        "status": "ok",
+        "command": "snowflake-sync-after-load",
+        "workflow_name": workflow_name,
+        "run_id": run_id,
+        "snowflake": metadata,
+        "source_load_call": f"CALL {source_load_procedure}('{workflow_name}', '{run_id}')",
+        "refresh_call": f"CALL {refresh_procedure}('{workflow_name}', '{run_id}')",
+    }
+    sys.stdout.write(json.dumps(result) + "\n")
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -263,6 +311,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_run_id_arg(full_reconcile)
     full_reconcile.set_defaults(handler=_handle_full_reconcile)
+
+    snowflake_sync = subparsers.add_parser(
+        "snowflake-sync-after-load",
+        help="Validate Snowflake runtime metadata and emit the SQL refresh calls.",
+    )
+    snowflake_sync.add_argument(
+        "--workflow-name",
+        required=True,
+        dest="workflow_name",
+        help="Warehouse workflow name passed to the Snowflake refresh procedures.",
+    )
+    _add_run_id_arg(snowflake_sync)
+    snowflake_sync.set_defaults(handler=_handle_snowflake_sync_after_load)
 
     return parser
 

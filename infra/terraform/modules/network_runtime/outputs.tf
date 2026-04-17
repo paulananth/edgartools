@@ -29,6 +29,6 @@ output "s3_vpc_endpoint_id" {
 }
 
 output "nat_gateway_id" {
-  description = "NAT gateway ID for private Snowflake task egress."
-  value       = aws_nat_gateway.this.id
+  description = "NAT gateway ID for private Snowflake task egress. Null when no private subnets are configured."
+  value       = length(aws_nat_gateway.this) > 0 ? aws_nat_gateway.this[0].id : null
 }
