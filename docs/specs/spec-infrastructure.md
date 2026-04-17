@@ -2,7 +2,7 @@
 
 ## Status
 
-COMPLETE -- all infrastructure implemented. Use this spec for verification only.
+COMPLETE -- all infrastructure implemented. Use this spec for verification and release-policy enforcement.
 
 ## References
 
@@ -69,7 +69,11 @@ s3://<snowflake-export-bucket>/warehouse/artifacts/snowflake_exports/...
 
 - Only one mutating warehouse execution may run at a time per environment in v1
 - Overlapping protection is operational and scheduler-driven, not enforced by DynamoDB
-- Do not provision DynamoDB, Glue, or Athena in v1; do not require private networking in v1
+- Do not provision DynamoDB, Glue, or Athena in v1; do not provision NAT gateways, private subnets,
+  or private ECS networking in v1
+- `accounts/dev` must support full `terraform destroy` of the account root
+- `accounts/prod` must not support full `terraform destroy` of the account root because the bronze
+  bucket remains protected by `prevent_destroy`
 
 _Source: specification.md lines 34-88_
 
@@ -113,18 +117,28 @@ _Source: specification.md lines 89-99_
 - `image_tag_mutability = "IMMUTABLE"` and `scan_on_push = true`
 - `container_image` must default to `null` with `coalesce(var.container_image, "scratch")` to allow
   first apply before image exists
+- Amazon ECR managed signing is recommended for release repositories, but remains outside Terraform in v1
 
 **Docker build rules:**
 
 - Copy only files needed to install and run: `pyproject.toml`, `README.md`, `LICENSE.txt`, `edgar/`
 - `.dockerignore` must exclude: `.git`, `.venv`, `tests/`, `infra/`, `data/`, `docs/`, `examples/`,
   `scripts/`, `notebooks/`, local temp directories, and `**/.terraform`
+- Build the deployable ECS image as `linux/amd64`
+- The repository must provide a reusable publish script and a reference CI buildspec for the warehouse image
+- Primary publish path is Linux-first direct registry push:
+  `docker buildx build --platform linux/amd64 --push ...`
+- Primary publish path should keep provenance and SBOM enabled so ECR stores OCI referrers for the image
+- Deployments must update Terraform only after ECR confirms the pushed digest
 
 **Windows/Docker Desktop push workaround:**
 
-The built-in HTTPS proxy (`192.168.65.1:3128`) drops layers larger than ~40 MB. Use `crane`
-(go-containerregistry): `docker save <image> -o /tmp/image.tar` then
-`crane push /tmp/image.tar <ecr-uri>:<tag>`.
+- Treat `crane` as a fallback-only publishing path from Windows Docker Desktop
+- Export a single-platform tarball: `docker save --platform linux/amd64 <image> -o /tmp/image.tar`
+- Push with `crane push /tmp/image.tar <ecr-uri>:<tag>`
+- If a `crane` push fails mid-upload, retry the same command; ECR reuses already-present blobs by digest
+- Disable provenance and SBOM attestations in the Windows fallback path so the tarball stays single-platform and simple
+- Verify the pushed image by digest before updating Terraform inputs
 
 _Source: specification.md lines 101-112_
 
@@ -179,7 +193,12 @@ silver, or canonical gold.
 | Roles | `EDGARTOOLS_<ENV>_DEPLOYER`, `EDGARTOOLS_<ENV>_REFRESHER`, `EDGARTOOLS_<ENV>_READER` |
 | Warehouses | `EDGARTOOLS_<ENV>_REFRESH_WH`, `EDGARTOOLS_<ENV>_READER_WH` |
 | Stage | `EDGARTOOLS_SOURCE_EXPORT_STAGE` |
-| File format | `EDGARTOOLS_SOURCE_EXPORT_FILE_FORMAT` |
+| Parquet file format | `EDGARTOOLS_SOURCE_EXPORT_FILE_FORMAT` |
+| Manifest file format | `EDGARTOOLS_SOURCE_RUN_MANIFEST_FILE_FORMAT` |
+| Manifest inbox | `EDGARTOOLS_SOURCE.SNOWFLAKE_RUN_MANIFEST_INBOX` |
+| Manifest pipe | `EDGARTOOLS_SOURCE.SNOWFLAKE_RUN_MANIFEST_PIPE` |
+| Manifest stream | `EDGARTOOLS_SOURCE.SNOWFLAKE_RUN_MANIFEST_STREAM` |
+| Manifest task | `EDGARTOOLS_GOLD.SNOWFLAKE_RUN_MANIFEST_TASK` |
 | Status table | `EDGARTOOLS_SOURCE.SNOWFLAKE_REFRESH_STATUS` |
 | Source load proc | `EDGARTOOLS_SOURCE.LOAD_EXPORTS_FOR_RUN` |
 | Refresh wrapper | `EDGARTOOLS_GOLD.REFRESH_AFTER_LOAD` |
@@ -191,17 +210,16 @@ silver, or canonical gold.
 - Use SnowCLI for SQL execution and bootstrap-only escape hatches
 - Use dbt for ongoing gold model changes, including new columns
 - Use Snowflake dynamic tables for runtime refresh, not ad hoc SQL chains
-- Trigger Snowflake refresh after every successful gold-affecting AWS warehouse run
+- Trigger Snowflake-native pull after every successful gold-affecting AWS warehouse run
 - If Snowflake refresh fails, mark the mirror stale; the canonical warehouse run remains successful
 
 ### Build Order
 
 1. Baseline platform objects: database, schemas, warehouses, account roles
-2. Import path: storage integration, stage, file format, technical status table
-3. Runtime SQL layer: source load procedure and public refresh wrapper
-4. Authentication: generate RSA key pair, store private key in Secrets Manager, register public key
-5. dbt layer: business-facing models, dynamic tables, tests, and `EDGARTOOLS_GOLD_STATUS`
-6. Runtime cutover: replace infrastructure-validation mode with real Snowflake import and refresh
+2. Import path: storage integration, stage, Parquet file format, manifest file format, manifest inbox, and Snowpipe
+3. Runtime SQL layer: manifest stream, source load procedure, public refresh wrapper, and triggered task
+4. dbt layer: business-facing models, dynamic tables, tests, and `EDGARTOOLS_GOLD_STATUS`
+5. Runtime cutover: replace AWS-managed Snowflake sync with Snowflake-native pull after export completion
 
 ### Runtime Modes
 
@@ -220,36 +238,26 @@ _Source: specification.md lines 127-220_
 
 ---
 
-## Snowflake Authentication
+## Snowflake Pull
 
-RSA key-pair authentication. No passwords, tokens, or static credentials in the runtime secret.
+Snowflake no longer depends on an AWS-managed sync task or runtime-held Snowflake credentials.
 
-### Secrets Layout
+### Pull Path
 
-| Secret | Contents | Managed by |
-|---|---|---|
-| `edgartools-<env>-snowflake-runtime` | JSON, 13 config-only fields (no credentials) | Terraform |
-| `edgartools-<env>-snowflake-private-key` | PEM-encoded RSA private key | Terraform (container), operator (value) |
-
-The ECS task's IAM role is the workload identity and controls access to both secrets.
-
-### Key-Pair Lifecycle
-
-1. Generate: `openssl genrsa 2048 | openssl pkcs8 -topk8 -inform PEM -out rsa_key.p8 -nocrypt`
-2. Store private key: `aws secretsmanager put-secret-value --secret-id edgartools-<env>-snowflake-private-key --secret-string "$(cat rsa_key.p8)"`
-3. Register public key: `ALTER USER ... SET RSA_PUBLIC_KEY = '...'`
-4. Rotate using `RSA_PUBLIC_KEY_2` for zero-downtime key rotation
-5. Bootstrap script: `infra/snowflake/sql/bootstrap/05_refresher_keypair.sql`
-6. Delete local key files after storing -- do not commit key files to the repository
+1. AWS writes Parquet export packages to the dedicated Snowflake export bucket.
+2. AWS writes one final run manifest under `manifests/` only after every table package for the run is durable.
+3. S3 object notifications on the manifest prefix publish to SNS.
+4. Snowpipe auto-ingests manifest rows into `EDGARTOOLS_SOURCE.SNOWFLAKE_RUN_MANIFEST_INBOX`.
+5. A triggered Snowflake task reads the manifest stream, calls `EDGARTOOLS_SOURCE.LOAD_EXPORTS_FOR_RUN`, then calls `EDGARTOOLS_GOLD.REFRESH_AFTER_LOAD`.
+6. dbt remains responsible only for `EDGARTOOLS_GOLD` models and tests.
 
 ### Rules
 
-- `edgartools-<env>-snowflake-runtime` must never contain `password`, `private_key`, `token`,
-  `secret`, or `client_secret` fields
-- `edgartools-<env>-snowflake-private-key` is injected as a separate ECS container secret
-- The private key is never logged and never included in runtime output
-- If the private key secret is absent, the sync task must fail with a clear error -- no fallback to
-  password auth
+- AWS must not write the watched Snowflake run manifest during `infrastructure_validation`
+- Snowpipe listens only to the manifest prefix, never the full Parquet export tree
+- `SNOWFLAKE_REFRESH_STATUS` is per-run, keyed by `(environment, source_workflow, run_id)`
+- AWS no longer needs a Snowflake runtime metadata secret or private-key secret
+- Snowflake-native task, pipe, and copy history become the mirror-health source of truth
 
 _Source: specification.md lines 222-278_
 
@@ -260,7 +268,8 @@ _Source: specification.md lines 222-278_
 | Check | Command |
 |---|---|
 | Terraform valid | `terraform fmt -check && terraform validate && terraform plan` |
-| Secrets exist | `aws secretsmanager describe-secret --secret-id edgartools-dev-edgar-identity` (repeat for `-snowflake-runtime`, `-snowflake-private-key`) |
+| Publish helper present | `bash infra/scripts/publish-warehouse-image.sh --help` |
+| Secrets exist | `aws secretsmanager describe-secret --secret-id edgartools-dev-edgar-identity` |
 | ECR immutable | `aws ecr describe-repositories --repository-names edgartools-dev-warehouse --query "repositories[0].{mutability:imageTagMutability,scan:imageScanningConfiguration}"` |
 | ECS image set | `aws ecs describe-task-definition --task-definition edgartools-dev-warehouse --query "taskDefinition.containerDefinitions[0].image"` |
 | Snowflake stage | `snow sql -q "LIST @EDGARTOOLS_SOURCE.EDGARTOOLS_SOURCE_EXPORT_STAGE" --connection edgartools-dev` |

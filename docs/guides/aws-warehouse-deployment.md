@@ -12,13 +12,11 @@ The AWS deployment covers the warehouse platform only:
 - mutable staging, silver, gold, and artifact storage
 - dedicated Snowflake export storage
 - ECS Fargate execution for warehouse commands
-- private ECS Fargate execution for Snowflake sync
 - Step Functions orchestration
 - EventBridge Scheduler for recurring workflows
 - Secrets Manager for `EDGAR_IDENTITY`
-- Secrets Manager for Snowflake runtime metadata
-- Secrets Manager for Snowflake RSA private key (key-pair authentication)
-- CloudWatch logs, Step Functions failure alarms, and a Snowflake degraded alarm
+- SNS notifications for Snowflake run manifests
+- CloudWatch logs and Step Functions failure alarms
 
 Explicitly out of scope in v1:
 
@@ -27,6 +25,7 @@ Explicitly out of scope in v1:
 - DynamoDB-based execution locking
 - CI/CD automation inside Terraform
 - always-on APIs, ALBs, or API Gateway
+- NAT gateways, private subnets, or private ECS networking
 
 ## Terraform layout
 
@@ -64,7 +63,6 @@ Each account owns its own:
 - Step Functions state machines
 - EventBridge schedules
 - Secrets Manager secret for `EDGAR_IDENTITY`
-- Secrets Manager secret for Snowflake runtime metadata
 - CloudWatch log group and alarms
 
 Deterministic names:
@@ -99,7 +97,7 @@ Snowflake export bucket:
 
 - stores one export package per business table per run for the Snowflake mirror
 - is isolated from the canonical warehouse bucket
-- is read by the private Snowflake sync runner
+- publishes manifest notifications that Snowpipe consumes through SNS
 
 Required prefixes:
 
@@ -143,12 +141,8 @@ For the current AWS runtime contract, that warehouse dependency set includes:
 
 The Docker build should copy only runtime-needed files such as `pyproject.toml`, `README.md`, `LICENSE.txt`, and `edgar/`, not the full repo tree.
 
-Gold-affecting workflows use two ECS steps:
-
-1. canonical warehouse task in public subnets
-2. Snowflake sync task in private subnets
-
-Index-only workflows stay single-step and do not invoke Snowflake sync.
+All workflows use a single canonical warehouse ECS task on public subnets. Snowflake import happens
+later through Snowflake-native pull after the final run manifest lands in S3.
 
 Step Functions state machines:
 
@@ -181,13 +175,12 @@ CLI commands exposed by the container:
 
 ## Secrets and IAM
 
-Three Secrets Manager secrets per environment:
+Two Secrets Manager secrets/resources per environment remain in AWS:
 
 | Secret | Purpose | Injected into |
 |---|---|---|
 | `edgartools-<env>-edgar-identity` | SEC EDGAR user-agent identity | Warehouse ECS task |
-| `edgartools-<env>-snowflake-runtime` | Snowflake config metadata (13 fields, no credentials) | Snowflake sync ECS task |
-| `edgartools-<env>-snowflake-private-key` | RSA private key for Snowflake key-pair auth | Snowflake sync ECS task |
+| `edgartools-<env>-runner-credentials` | Manual runner access key for Step Functions triggering | Operator / runner client |
 
 Warehouse task role access is scoped to:
 
@@ -197,18 +190,8 @@ Warehouse task role access is scoped to:
 - CloudWatch Logs
 - the EDGAR identity secret
 
-Snowflake sync task role access is scoped to:
-
-- Snowflake export bucket read only
-- CloudWatch Logs
-
-Snowflake sync execution role access is scoped to:
-
-- Snowflake runtime metadata secret read
-- Snowflake private key secret read
-- KMS decrypt for the export CMK
-
-No static AWS keys are used inside the application runtime. The Snowflake sync task authenticates to Snowflake using RSA key-pair auth, not passwords.
+No Snowflake credential is required in AWS application runtime. Snowflake pulls from S3 natively after
+AWS publishes the final run manifest.
 
 ## Bootstrap and apply flow
 
@@ -233,32 +216,65 @@ Example `backend.hcl` values are checked into each account root as `backend.hcl.
 
 The `container_image` value should be set to an ECR image tag or, preferably, an image digest.
 
+Minimum `terraform.tfvars` values for a runnable deployment:
+
+```hcl
+container_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/edgartools-dev-warehouse@sha256:replace-me"
+edgar_identity_value = "Your Name your.email@example.com"
+```
+
+Destroy policy:
+
+- `infra/terraform/accounts/dev` is intentionally destroyable and uses force-delete semantics for
+  the dev data buckets, ECR repository, and runner IAM user.
+- `infra/terraform/accounts/prod` is intentionally not destroyable from the account root because
+  the protected storage module keeps the bronze bucket behind `prevent_destroy`.
+- `infra/terraform/bootstrap-state` remains separate from both account roots. Destroying an account
+  root does not remove the Terraform state bucket.
+
 ## Building and pushing the container image
 
 The ECR repository uses `image_tag_mutability = IMMUTABLE`. You cannot push a tag that already exists; always use a new tag (e.g. the git short SHA).
 
-Standard build and push flow:
+Recommended release policy:
+
+- Primary release path is Linux-first direct registry push from CI, CodeBuild, EC2, or WSL2
+- Windows Docker Desktop local publishing is fallback-only and should not be the normal release mechanism
+- Build a single-platform Linux image for ECS/Fargate: `linux/amd64`
+- Keep provenance and SBOM enabled on the primary publish path so ECR can retain OCI referrers for the image
+- Use immutable tags such as the git SHA, then deploy ECS by digest after ECR verification
+- Keep ECR `scan_on_push` enabled and add Amazon ECR managed signing outside Terraform when the environment is ready for signature enforcement
+- The repository-standard publish helper is `infra/scripts/publish-warehouse-image.sh`
+- The reference CodeBuild entrypoint is `infra/codebuild/buildspec.publish-warehouse-image.yml`
+
+Primary Linux push flow:
 
 ```bash
 GIT_SHA=$(git rev-parse --short HEAD)
-ECR_URL="<account-id>.dkr.ecr.us-east-1.amazonaws.com/edgartools-<env>-warehouse"
-
-# Build
-docker build -t "edgartools-warehouse:${GIT_SHA}" .
-
-# Authenticate
-aws ecr get-login-password --region us-east-1 --profile <profile> \
-  | docker login --username AWS --password-stdin "<account-id>.dkr.ecr.us-east-1.amazonaws.com"
-
-# Push
-docker push "${ECR_URL}:${GIT_SHA}"
+bash infra/scripts/publish-warehouse-image.sh \
+  --aws-profile <profile> \
+  --aws-region us-east-1 \
+  --ecr-repository edgartools-<env>-warehouse \
+  --image-tag "${GIT_SHA}" \
+  --mode linux \
+  --output-file image-ref.txt
 ```
+
+The helper performs the direct `buildx --push`, verifies the image in ECR, and writes the final
+digest reference to `image-ref.txt`. In Linux mode it bootstraps a `docker-container` buildx
+builder so provenance and SBOM attestations work in CI and CodeBuild.
+
+When using CodeBuild, configure the project to read this repository and point the buildspec at:
+
+`infra/codebuild/buildspec.publish-warehouse-image.yml`
 
 ### Windows / Docker Desktop proxy workaround
 
-Docker Desktop on Windows routes all HTTPS traffic through an internal proxy (`192.168.65.1:3128`). This proxy drops large layer uploads (layers > ~40 MB, e.g. the `pyarrow` layer). The push will fail silently with a broken-pipe error on the large layer.
+Docker Desktop on Windows routes registry traffic through an internal proxy (`192.168.65.1:3128`). In practice this makes ECR publication brittle for this image because the warehouse dependency set includes large layers, especially `pyarrow`. The usual failure mode is a mid-upload `broken pipe` or `connection reset` while publishing one large blob.
 
-Use `crane` (go-containerregistry) instead of `docker push`:
+Use `crane` (go-containerregistry) only as the Windows fallback path. Also export a single-platform tarball so the pushed artifact is as simple as possible.
+
+Windows publishing flow:
 
 ```bash
 # Install crane (one-time)
@@ -266,22 +282,73 @@ curl -L "https://github.com/google/go-containerregistry/releases/download/v0.20.
   -o /tmp/crane.tar.gz
 tar -xzf /tmp/crane.tar.gz -C /tmp/ crane.exe
 
-# Save image to file (crane reads from a tar, not the Docker daemon socket)
-docker save "edgartools-warehouse:${GIT_SHA}" -o /tmp/edgartools-warehouse.tar
+# Build a single-platform image without provenance attestations
+docker buildx build \
+  --platform linux/amd64 \
+  --provenance=false \
+  --sbom=false \
+  --load \
+  -t "edgartools-warehouse:${GIT_SHA}" .
 
-# Push with crane (bypasses Docker Desktop proxy entirely)
-/tmp/crane.exe push /tmp/edgartools-warehouse.tar "${ECR_URL}:${GIT_SHA}"
+# Save only the ECS target platform to a tar file
+docker save \
+  --platform linux/amd64 \
+  "edgartools-warehouse:${GIT_SHA}" \
+  -o /tmp/edgartools-warehouse-amd64.tar
+
+# Authenticate once
+aws ecr get-login-password --region us-east-1 --profile <profile> \
+  | /tmp/crane.exe auth login -u AWS --password-stdin "<account-id>.dkr.ecr.us-east-1.amazonaws.com"
+
+# Push with crane
+/tmp/crane.exe push /tmp/edgartools-warehouse-amd64.tar "${ECR_URL}:${GIT_SHA}"
 ```
 
-Crane pushes individual layers using its own HTTP client, which does not route through the Docker Desktop proxy. The push succeeds even for large layers.
+If `crane push` fails on a single remaining blob, rerun the same command. ECR keeps already-published blobs by digest, so retries usually continue from the remaining upload work instead of restarting from zero.
 
-After a successful push, update `container_image` in `terraform.tfvars` to the new digest printed by crane:
+Verification after push:
+
+```bash
+CRANE_DIGEST=$(/tmp/crane.exe digest "${ECR_URL}:${GIT_SHA}")
+aws ecr describe-images \
+  --repository-name "edgartools-<env>-warehouse" \
+  --region us-east-1 \
+  --profile <profile> \
+  --image-ids imageTag="${GIT_SHA}"
+```
+
+Only update `terraform.tfvars` after the image tag is visible in ECR and the digest is known.
+
+After a successful push, update `container_image` in `terraform.tfvars` to the verified digest:
 
 ```bash
 # crane prints the digest after push, e.g.:
 # <ecr-url>@sha256:b7c361b843eb53b6c0afdd3ff9a03305c12ecc1619647f67a89211b648ead225
 # Use the @sha256:... form in terraform.tfvars for immutable production references.
 ```
+
+### Cold redeploy order
+
+For a full `dev` destroy/recreate or a first deployment in a new account, use this order:
+
+1. Apply the AWS account root to create the VPC, buckets, IAM roles, ECS cluster, Step Functions, and ECR repository.
+2. Build and publish the image to ECR, then verify the tag and digest exist.
+3. Update `container_image` in `terraform.tfvars` to the pushed digest.
+4. Re-apply the AWS account root so ECS task definitions reference the new digest.
+5. Bootstrap or refresh Snowflake-native pull objects with the current `snowflake_manifest_sns_topic_arn`.
+6. Only then trigger warehouse workflows.
+
+Do not destroy and recreate Snowflake pull objects against a stale SNS topic ARN from the previous AWS deployment.
+
+## Image publishing RCA
+
+The repeated local ECR publication failures observed on Windows were caused by:
+
+1. a large warehouse runtime layer, mainly from `pyarrow`
+2. Docker Desktop proxying registry uploads through an unstable local proxy path
+3. local release attempts relying on a Windows host instead of a Linux runner with direct `buildx --push`
+4. local BuildKit producing an OCI index with extra metadata unless provenance is disabled on the Windows fallback path
+5. cold redeploy sequencing not making image publication and digest verification an explicit gate before workflow execution
 
 ## Operator runbook
 
@@ -304,6 +371,25 @@ Manual workflows:
 This is a temporary v1 operational control because no distributed application lock is provisioned.
 
 Always trigger workflows using the runner IAM account (`edgartools-<env>-runner`), not the Terraform deployer account. Runner credentials are stored in Secrets Manager under `edgartools-<env>-runner-credentials`.
+
+#### Runner credential initialization
+
+Terraform creates the runner IAM user and the runner credentials secret container, but it does not create an access key. Complete the bootstrap after apply:
+
+```bash
+RUNNER_USER="edgartools-dev-runner"
+RUNNER_SECRET_ID="edgartools-dev-runner-credentials"
+ACCESS_KEY_JSON=$(aws iam create-access-key --user-name "$RUNNER_USER" --profile edgartools-dev)
+RUNNER_ACCESS_KEY_ID=$(echo "$ACCESS_KEY_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['AccessKey']['AccessKeyId'])")
+RUNNER_SECRET_ACCESS_KEY=$(echo "$ACCESS_KEY_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['AccessKey']['SecretAccessKey'])")
+
+aws secretsmanager put-secret-value \
+  --secret-id "$RUNNER_SECRET_ID" \
+  --profile edgartools-dev \
+  --secret-string "{\"aws_access_key_id\":\"$RUNNER_ACCESS_KEY_ID\",\"aws_secret_access_key\":\"$RUNNER_SECRET_ACCESS_KEY\",\"aws_region\":\"us-east-1\"}"
+```
+
+Delete or rotate the access key through IAM and overwrite the secret if runner credentials are ever reissued.
 
 #### Step Functions input requirements
 
@@ -376,26 +462,11 @@ aws secretsmanager put-secret-value \
   --secret-string "Your Name your.email@example.com"
 ```
 
-### Snowflake private key initialization
+### Snowflake manifest topic handoff
 
-Terraform creates the `edgartools-<env>-snowflake-private-key` secret container. Populate it with an RSA private key for key-pair authentication:
-
-```bash
-# Generate a 2048-bit RSA key pair (PKCS#8, unencrypted)
-openssl genrsa 2048 | openssl pkcs8 -topk8 -inform PEM -out rsa_key.p8 -nocrypt
-openssl rsa -in rsa_key.p8 -pubout -out rsa_key.pub
-
-# Store the private key in Secrets Manager
-aws secretsmanager put-secret-value \
-  --secret-id edgartools-dev-snowflake-private-key \
-  --secret-string "$(cat rsa_key.p8)" \
-  --profile edgartools-dev
-
-# Register the public key on the Snowflake user
-# See: infra/snowflake/sql/bootstrap/05_refresher_keypair.sql
-```
-
-> **Important**: Delete the local key files (`rsa_key.p8`, `rsa_key.pub`) after storing the private key in Secrets Manager and registering the public key in Snowflake. Do not commit key files to the repository.
+After apply, capture the `snowflake_manifest_sns_topic_arn` output from the AWS account root.
+Pass that ARN into the Snowflake bootstrap session as `manifest_sns_topic_arn` so Snowpipe can
+subscribe to manifest notifications from the export bucket.
 
 ## Validation
 
@@ -411,7 +482,8 @@ Runtime checks in `dev`:
 
 - trigger `bootstrap-recent-10` via the runner account with `{"cik_list":"320193,789019,1045810"}` as execution input
 - confirm bronze objects land only in the bronze bucket under `warehouse/bronze/submissions/sec/cik=<cik>/...`
-- confirm run manifests land in the warehouse bucket under `warehouse/silver/sec/runs/...`
+- confirm Snowflake export Parquet files land in the export bucket under `warehouse/artifacts/snowflake_exports/<table>/...`
+- confirm final Snowflake run manifests land in the export bucket under `warehouse/artifacts/snowflake_exports/manifests/...`
 - check CloudWatch log output for `silver_table_counts` — expect `sec_company=3`, `sec_company_filing=30` (10 × 3 companies) for the three test CIKs
 - confirm failed Step Functions executions appear in CloudWatch alarms
 - trigger `load-daily-form-index-for-date` with `{"target_date": "YYYY-MM-DD"}` for a known business date and confirm `sec_daily_index_checkpoint` checkpoint appears in the silver layer log output

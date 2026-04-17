@@ -97,10 +97,6 @@ def _handle_full_reconcile(args: argparse.Namespace) -> int:
     return run_command("full-reconcile", args)
 
 
-def _handle_snowflake_sync_after_load(args: argparse.Namespace) -> int:
-    return run_command("snowflake-sync-after-load", args)
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="edgar-warehouse",
@@ -267,18 +263,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_run_id_arg(full_reconcile)
     full_reconcile.set_defaults(handler=_handle_full_reconcile)
-
-    snowflake_sync = subparsers.add_parser(
-        "snowflake-sync-after-load",
-        help="Load Snowflake exports and invoke the post-load refresh wrapper.",
-    )
-    snowflake_sync.add_argument(
-        "--workflow-name",
-        required=True,
-        help="Canonical warehouse workflow name that produced the export package",
-    )
-    _add_run_id_arg(snowflake_sync)
-    snowflake_sync.set_defaults(handler=_handle_snowflake_sync_after_load)
 
     return parser
 

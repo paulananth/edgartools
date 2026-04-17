@@ -16,6 +16,7 @@ import pytest
 
 from edgar_warehouse.runtime import StorageLocation, WarehouseRuntimeError, _filter_ciks_to_universe
 from edgar_warehouse.silver import SilverDatabase
+from tests.warehouse_result_helpers import report_duckdb_table
 
 _FAKE_SHA256 = "deadbeef" * 8  # 64-char hex string, valid SHA-256 length
 
@@ -410,3 +411,29 @@ def test_stage_daily_index_filing_loader_record_hash():
     hash_input = f"{row['form']}|{row['company_name']}|{row['cik']}|{row['filing_date']}|{row['file_name']}"
     expected = hashlib.sha256(hash_input.encode()).hexdigest()
     assert row["record_hash"] == expected
+
+
+@pytest.mark.fast
+def test_daily_index_storage_reports_table_summaries(db):
+    rows = _load_daily_idx_rows()
+    db.merge_daily_index_filings(rows, _DAILY_IDX_SYNC_RUN_ID)
+    db.upsert_daily_index_checkpoint(
+        {
+            "business_date": _BUSINESS_DATE,
+            "source_key": f"date:{_BUSINESS_DATE}",
+            "source_url": _DAILY_IDX_SOURCE_URL,
+            "expected_available_at": _EXPECTED_AVAILABLE_AT,
+            "last_attempt_at": _EXPECTED_AVAILABLE_AT,
+            "last_success_at": _EXPECTED_AVAILABLE_AT,
+            "row_count": len(rows),
+            "distinct_cik_count": 3,
+            "distinct_accession_count": 3,
+            "status": "succeeded",
+        }
+    )
+
+    filing_summary = report_duckdb_table(db._conn, "stg_daily_index_filing")
+    checkpoint_summary = report_duckdb_table(db._conn, "sec_daily_index_checkpoint")
+
+    assert filing_summary["row_count"] == 3
+    assert checkpoint_summary["row_count"] == 1

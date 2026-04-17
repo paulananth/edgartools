@@ -1,13 +1,16 @@
--- Create the public Snowflake refresh wrapper for the EdgarTools gold mirror.
+-- Create the public Snowflake refresh wrapper and triggered manifest-processing task.
 --
 -- Required session variables:
 --   set database_name = 'EDGARTOOLS_DEV';
 --   set source_schema_name = 'EDGARTOOLS_SOURCE';
 --   set gold_schema_name = 'EDGARTOOLS_GOLD';
 --   set deployer_role_name = 'EDGARTOOLS_DEV_DEPLOYER';
---   set status_table_name = 'SNOWFLAKE_REFRESH_STATUS';
---   set source_load_procedure_name = 'EDGARTOOLS_SOURCE.LOAD_EXPORTS_FOR_RUN';
+--   set refresh_warehouse_name = 'EDGARTOOLS_DEV_REFRESH_WH';
+--   set manifest_stream_name = 'SNOWFLAKE_RUN_MANIFEST_STREAM';
+--   set source_load_procedure_name = 'LOAD_EXPORTS_FOR_RUN';
 --   set refresh_procedure_name = 'REFRESH_AFTER_LOAD';
+--   set stream_processor_procedure_name = 'PROCESS_RUN_MANIFEST_STREAM';
+--   set manifest_task_name = 'SNOWFLAKE_RUN_MANIFEST_TASK';
 
 USE ROLE IDENTIFIER($deployer_role_name);
 USE DATABASE IDENTIFIER($database_name);
@@ -19,75 +22,56 @@ LANGUAGE SQL
 EXECUTE AS OWNER
 AS
 $$
-DECLARE
-  load_result VARIANT;
 BEGIN
-  MERGE INTO EDGARTOOLS_SOURCE.SNOWFLAKE_REFRESH_STATUS AS target
-  USING (
-    SELECT
-      CURRENT_DATABASE() AS environment,
-      :workflow_name AS source_workflow,
-      :run_id AS run_id,
-      NULL::DATE AS business_date,
-      'registered' AS source_load_status,
-      'pending' AS refresh_status,
-      'pending' AS status,
-      NULL::STRING AS error_message,
-      NULL::TIMESTAMP_TZ AS last_successful_refresh_at,
-      CURRENT_TIMESTAMP() AS updated_at
-  ) AS source
-  ON target.environment = source.environment
-    AND target.source_workflow = source.source_workflow
-  WHEN MATCHED THEN UPDATE SET
-    run_id = source.run_id,
-    source_load_status = source.source_load_status,
-    refresh_status = source.refresh_status,
-    status = source.status,
-    error_message = source.error_message,
-    updated_at = source.updated_at
-  WHEN NOT MATCHED THEN INSERT (
-    environment,
-    source_workflow,
-    run_id,
-    business_date,
-    source_load_status,
-    refresh_status,
-    status,
-    error_message,
-    last_successful_refresh_at,
-    updated_at
-  ) VALUES (
-    source.environment,
-    source.source_workflow,
-    source.run_id,
-    source.business_date,
-    source.source_load_status,
-    source.refresh_status,
-    source.status,
-    source.error_message,
-    source.last_successful_refresh_at,
-    source.updated_at
-  );
+  UPDATE EDGARTOOLS_SOURCE.SNOWFLAKE_REFRESH_STATUS
+  SET
+    refresh_status = 'succeeded',
+    status = 'succeeded',
+    error_message = NULL,
+    last_successful_refresh_at = CURRENT_TIMESTAMP(),
+    updated_at = CURRENT_TIMESTAMP()
+  WHERE source_workflow = :workflow_name
+    AND run_id = :run_id
+    AND source_load_status = 'succeeded';
 
-  load_result := OBJECT_CONSTRUCT(
-    'status', 'registered',
+  RETURN OBJECT_CONSTRUCT(
+    'status', 'succeeded',
     'workflow_name', :workflow_name,
     'run_id', :run_id
   );
-
-  UPDATE EDGARTOOLS_SOURCE.SNOWFLAKE_REFRESH_STATUS
-  SET
-    refresh_status = 'ready_for_dbt_refresh',
-    status = 'ready_for_dbt_refresh',
-    updated_at = CURRENT_TIMESTAMP()
-  WHERE environment = CURRENT_DATABASE()
-    AND source_workflow = :workflow_name;
-
-  RETURN OBJECT_CONSTRUCT(
-    'status', 'ready_for_dbt_refresh',
-    'workflow_name', :workflow_name,
-    'run_id', :run_id,
-    'load_result', load_result
-  );
 END;
 $$;
+
+CREATE OR REPLACE PROCEDURE IDENTIFIER($stream_processor_procedure_name)()
+RETURNS VARIANT
+LANGUAGE SQL
+EXECUTE AS OWNER
+AS
+$$
+BEGIN
+  FOR manifest_record IN (
+    SELECT DISTINCT workflow_name, run_id
+    FROM EDGARTOOLS_SOURCE.SNOWFLAKE_RUN_MANIFEST_STREAM
+    WHERE METADATA$ACTION = 'INSERT'
+  ) DO
+    CALL EDGARTOOLS_SOURCE.LOAD_EXPORTS_FOR_RUN(manifest_record.workflow_name, manifest_record.run_id);
+    CALL EDGARTOOLS_GOLD.REFRESH_AFTER_LOAD(manifest_record.workflow_name, manifest_record.run_id);
+  END FOR;
+
+  RETURN OBJECT_CONSTRUCT('status', 'succeeded');
+END;
+$$;
+
+BEGIN
+  EXECUTE IMMEDIATE
+    'CREATE OR REPLACE TASK ' || $manifest_task_name || '
+       WAREHOUSE = ' || $refresh_warehouse_name || '
+       WHEN SYSTEM$STREAM_HAS_DATA(''' || $database_name || '.' || $source_schema_name || '.' || $manifest_stream_name || ''')
+       AS
+       CALL ' || $database_name || '.' || $gold_schema_name || '.' || $stream_processor_procedure_name || '()';
+END;
+
+BEGIN
+  EXECUTE IMMEDIATE
+    'ALTER TASK ' || $manifest_task_name || ' RESUME';
+END;

@@ -98,35 +98,35 @@ Source: specification.md lines 345-350.
 - Grain: one row per reporting person/entity in ownership filings
 - Natural key: CIK or name-based hash for non-CIK parties
 - Note: conformed actor dimension shared across ownership and ADV facts
-- Status: PENDING - schema not defined; no source silver data yet
+- Status: IMPLEMENTED in gold.py
 
 ### dim_security
 
 - Grain: one row per security/instrument; natural key: issuer_cik + security_type
-- Source: ownership filing silver tables (pending)
-- Status: PENDING
+- Source: ownership filing silver tables
+- Status: IMPLEMENTED in gold.py
 
 ### dim_ownership_txn_type
 
 - Grain: one row per transaction code (A/D codes from Forms 3/4/5)
 - Source: static reference data
-- Status: PENDING
+- Status: IMPLEMENTED in gold.py
 
 ### dim_geography
 
 - Grain: one row per state/country code; source: reference data + ADV addresses
-- Status: PENDING
+- Status: IMPLEMENTED in gold.py
 
 ### dim_disclosure_category
 
 - Grain: one row per ADV disclosure category; source: Form ADV Part 1A section 11
-- Status: PENDING
+- Status: IMPLEMENTED in gold.py
 
 ### dim_private_fund
 
 - Grain: one row per private fund; natural key: adviser_cik + fund_id
-- Source: Form ADV Schedule D (pending)
-- Status: PENDING
+- Source: Form ADV Schedule D silver tables
+- Status: IMPLEMENTED in gold.py
 
 ## Facts
 
@@ -147,53 +147,56 @@ Source: specification.md lines 345-350.
 - Natural key: accession_number + sequence_number
 - FK dimensions: company_key, date_key, form_key, party_key, security_key,
   ownership_txn_type_key
-- Source silver tables: ownership transaction tables (pending silver implementation)
-- Status: PENDING - schema not defined in gold.py
+- Source silver tables: ownership transaction silver tables
+- Status: IMPLEMENTED in gold.py
 
 ### fact_ownership_holding_snapshot
 
 - Grain: one row per period-end holding position
 - Natural key: accession_number + security_key + holding_type
 - FK dimensions: company_key, date_key, party_key, security_key
-- Source silver tables: ownership holding tables (pending silver implementation)
-- Status: PENDING - schema not defined in gold.py
+- Source silver tables: ownership holding silver tables
+- Status: IMPLEMENTED in gold.py
 
 ### fact_adv_office
 
 - Grain: one row per adviser office record from Form ADV Part 1A
 - Natural key: adviser_cik + office_sequence
 - FK dimensions: company_key, date_key, geography_key
-- Source silver tables: ADV silver tables (pending silver implementation)
-- Status: PENDING - schema not defined in gold.py
+- Source silver tables: ADV silver tables
+- Status: IMPLEMENTED in gold.py
 
 ### fact_adv_disclosure
 
 - Grain: one row per disclosure item from Form ADV Part 1A section 11
 - Natural key: adviser_cik + disclosure_category_code + as_of_date
 - FK dimensions: company_key, date_key, disclosure_category_key
-- Source silver tables: ADV silver tables (pending silver implementation)
-- Status: PENDING - schema not defined in gold.py
+- Source silver tables: ADV silver tables
+- Status: IMPLEMENTED in gold.py
 
 ### fact_adv_private_fund
 
 - Grain: one row per private fund per filing
 - Natural key: adviser_cik + fund_id + filing_date
 - FK dimensions: company_key, date_key, private_fund_key
-- Source silver tables: ADV Schedule D tables (pending silver implementation)
-- Status: PENDING - schema not defined in gold.py
+- Source silver tables: ADV Schedule D silver tables
+- Status: IMPLEMENTED in gold.py
 
 ## Snowflake Export Contract
 
 Source: specification.md lines 127-210.
 
 AWS writes one Parquet package per business table per run into a dedicated Snowflake
-export bucket. The Snowflake sync task reads the export bucket and calls the single
-public wrapper: CALL EDGARTOOLS_GOLD.REFRESH_AFTER_LOAD(workflow_name, run_id).
+export bucket. AWS then writes one final run manifest under the manifests/ prefix.
+Snowpipe auto-ingests only that manifest, and a triggered Snowflake task calls:
+CALL EDGARTOOLS_SOURCE.LOAD_EXPORTS_FOR_RUN(workflow_name, run_id)
+then
+CALL EDGARTOOLS_GOLD.REFRESH_AFTER_LOAD(workflow_name, run_id).
 
 Export bucket path pattern:
   {table_path}/business_date={business_date}/run_id={run_id}/{table_name}.parquet
 
-The 8 SNOWFLAKE_EXPORT_TABLES from runtime.py (key = Snowflake table name,
+The 8 `SNOWFLAKE_EXPORT_TABLES` from `runtime.py` (key = Snowflake source table name,
 value = export path prefix):
 
 | Key                 | Path Prefix          | Maps To Gold Table             |
@@ -207,17 +210,18 @@ value = export path prefix):
 | PRIVATE_FUNDS       | private_funds        | fact_adv_private_fund          |
 | FILING_DETAIL       | filing_detail        | dim_filing                     |
 
-Current gold.py write_gold_to_snowflake_export only handles COMPANY and FILING_ACTIVITY.
-The remaining 6 export paths need wiring once the corresponding gold tables are built.
+The canonical runtime writes all 8 export paths from `write_gold_to_snowflake_export()`.
+Each run manifest records `table_name`, `relative_path`, `file_count`, and `row_count`
+for every export family.
 
 Snowflake objects that consume these packages:
 - database: EDGARTOOLS_DEV / EDGARTOOLS_PROD
-- schemas: EDGARTOOLS_SOURCE (staging), EDGARTOOLS_GOLD (curated business tables)
+- schemas: EDGARTOOLS_SOURCE (native pull source layer), EDGARTOOLS_GOLD (curated business tables)
 - status view: EDGARTOOLS_GOLD_STATUS
 
 ## Implementation Plan
 
-### Already in gold.py (silver-gold-phase-a-c worktree)
+### Implemented in gold.py
 
 - Surrogate key helper: _det_key() using SHA-256 truncated to int64
 - Form family derivation: _form_family()
@@ -226,27 +230,14 @@ Snowflake objects that consume these packages:
 - Build functions: _build_dim_company, _build_dim_form, _build_dim_date,
   _build_dim_filing, _build_fact_filing_activity
 - Public API: build_gold(), write_gold_to_storage(), write_gold_to_snowflake_export()
-- Snowflake export: COMPANY and FILING_ACTIVITY only
+- Snowflake export: all 8 export families wired
 
-### Pending implementation
+### Remaining hardening
 
-1. Schemas and build functions for 6 remaining dimensions:
-   dim_party, dim_security, dim_ownership_txn_type, dim_geography,
-   dim_disclosure_category, dim_private_fund
-
-2. Schemas and build functions for 5 remaining facts:
-   fact_ownership_transaction, fact_ownership_holding_snapshot,
-   fact_adv_office, fact_adv_disclosure, fact_adv_private_fund
-
-3. SCD-2 version columns (effective_from, effective_to, is_current) on dimensions
-   that require history tracking (dim_company, dim_party at minimum)
-
-4. Expand write_gold_to_snowflake_export to cover all 8 SNOWFLAKE_EXPORT_TABLES
-
-5. Wire build_gold() into runtime.py RunContext so gold is built and written on
-   every bronze_capture+ mode run
-
-6. runtime.py: add gold write step to the step-by-step run orchestration
+1. Add network/VCR-backed verification that loads real exported Parquet into Snowflake source tables.
+2. Add dbt verification that curated Snowflake gold models build cleanly from the source tables.
+3. Decide whether Snowflake source tables remain current-state only or grow a separate historical mirror contract.
+4. Add any required dimension history semantics only if a downstream business use case demands them.
 
 ## Acceptance Criteria
 
@@ -274,10 +265,18 @@ Test files to create:
   - test_surrogate_key_uniqueness: all dim keys unique in each dimension table
   - test_build_gold_idempotent: two calls return identical tables
   - test_build_gold_empty_silver: returns empty tables with correct schemas
-  - test_snowflake_export_paths: verify path pattern and file presence for 8 tables
+  - test_snowflake_export_paths: verify path pattern, file presence, schema-order columns,
+    and row counts for 8 tables
+  - every validated gold table must emit a result summary with `table`, ordered `columns`,
+    and `row_count`
 
 - tests/test_warehouse_e2e_smoke.py (NEW)
   - test_e2e_bronze_to_gold: full pipeline from bronze capture through gold write,
     assert at least 1 row in dim_company and fact_filing_activity
   - test_e2e_snowflake_export_written: assert all 8 export packages written to
     export bucket after a successful run
+  - every asserted gold or export table must emit a result summary with `table`, ordered
+    `columns`, and `row_count`
+
+Use the shared warehouse verification helper for both in-process verification and Parquet
+output verification. Export verification is incomplete if it only checks file presence.

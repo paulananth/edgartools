@@ -86,7 +86,14 @@ Git publishing rule:
 Execution rules:
 
 - Use Git Bash for all verification, testing, build, Docker, and Terraform commands
+- Always use `uv` for Python commands in this workspace, including verification and ad hoc scripts
+- Prefer `uv run <command>` over direct `python`, `pytest`, or `hatch` invocations
 - Do not use PowerShell for testing, building, or deployment commands unless the user explicitly requires it
+- Preferred repository policy for AWS ECR publishing is Linux-first: use CI, CodeBuild, EC2, or WSL and publish with direct `docker buildx build --push`
+- In this Windows workspace, treat `crane` as a fallback only when a Linux runner is unavailable or Docker Desktop push is unreliable
+- If a normal `docker push` fails with Docker Desktop proxy errors, broken pipes, or connection resets, switch to `crane` without asking again
+- Reuse a locally downloaded `crane.exe` when present; otherwise download the pinned release needed for the task and continue
+- After any push, verify the published image by digest using `aws ecr describe-images`; `crane digest` is an acceptable secondary check
 
 ## Warehouse Work
 
@@ -173,10 +180,10 @@ Every new user-facing feature must include:
 ### Verification Commands
 
 ```bash
-hatch run test-fast
-hatch run test-network
-hatch run test-regression
-hatch run cov
+uv run pytest -m fast
+uv run pytest -m network
+uv run pytest -m regression
+uv run pytest --cov
 ```
 
 Only parallelize fast tests to avoid SEC rate limits.

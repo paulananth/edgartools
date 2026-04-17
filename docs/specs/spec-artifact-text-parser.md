@@ -130,9 +130,9 @@ on analyst demand via `targeted-resync` with `scope_type = accession`.
 explicitly resynced, or within a configured backfill policy. Skip if `raw_object_id` is
 already populated and the `sha256` matches.
 
-**Runtime wiring required:** `runtime.py targeted-resync` currently raises
-`WarehouseRuntimeError` for `scope_type = accession` (line 606). Artifact fetch must
-add a handler branch for `scope_type = "accession"` that invokes `artifacts.fetch_filing_artifacts`.
+**Runtime wiring:** `runtime.py targeted-resync` must keep the accession-scope branch
+that invokes `artifacts.fetch_filing_artifacts`, text extraction, and parser reruns without
+requiring a broader CIK rebuild.
 
 ---
 
@@ -264,3 +264,13 @@ Test files to create under `tests/warehouse/`:
 
 All tests that touch the database must use an in-memory DuckDB fixture consistent with the
 DDL in `silver.py`. Network calls must be covered by VCR cassettes.
+
+Each workflow-level verification must also emit result summaries for the tables it asserts:
+
+- `sec_raw_object`
+- `sec_filing_attachment`
+- `sec_filing_text`
+- `sec_parse_run`
+
+Each summary must include `table`, ordered `columns`, and `row_count` using the shared
+warehouse verification helper.

@@ -5,6 +5,7 @@ Fast tests only - no network calls.
 import pytest
 from datetime import datetime
 from edgar_warehouse.silver import SilverDatabase
+from tests.warehouse_result_helpers import report_duckdb_table
 
 @pytest.fixture
 def db(tmp_path):
@@ -84,3 +85,13 @@ def test_start_parse_run_raises_on_missing_parse_run_id(db):
 def test_complete_parse_run_raises_on_empty_id(db):
     with pytest.raises(ValueError):
         db.complete_parse_run("")
+
+
+@pytest.mark.fast
+def test_parse_run_reports_table_summary(db):
+    db.start_parse_run(_BASE_RUN)
+    db.complete_parse_run("run-001", status="succeeded", rows_written=0)
+
+    summary = report_duckdb_table(db._conn, "sec_parse_run")
+
+    assert summary["row_count"] == 1

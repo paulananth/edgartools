@@ -5,6 +5,7 @@ Fast tests only - no network calls.
 import pytest
 from datetime import datetime, timezone
 from edgar_warehouse.silver import SilverDatabase
+from tests.warehouse_result_helpers import report_duckdb_table
 
 _NOW = datetime(2025, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
 _ACCESSION = "0000320193-24-000123"
@@ -90,3 +91,12 @@ def test_get_all_filing_texts_empty_for_unknown(db):
 def test_upsert_filing_text_raises_on_missing_required_field(db):
     with pytest.raises(ValueError):
         db.upsert_filing_text({})
+
+
+@pytest.mark.fast
+def test_filing_text_reports_table_summary(db):
+    db.upsert_filing_text(_TEXT_ROW)
+
+    summary = report_duckdb_table(db._conn, "sec_filing_text")
+
+    assert summary["row_count"] == 1

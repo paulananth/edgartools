@@ -33,9 +33,9 @@ output "state_machine_arns" {
   value       = module.runtime.state_machine_arns
 }
 
-output "snowflake_runtime_secret_arn" {
-  description = "Prod Snowflake runtime metadata secret ARN."
-  value       = module.runtime.snowflake_runtime_secret_arn
+output "snowflake_manifest_sns_topic_arn" {
+  description = "Prod SNS topic ARN for Snowflake export run-manifest notifications."
+  value       = module.runtime.snowflake_manifest_sns_topic_arn
 }
 
 output "runner_user_name" {
@@ -49,6 +49,6 @@ output "runner_user_arn" {
 }
 
 output "runner_credentials_secret_arn" {
-  description = "Prod runner credentials secret ARN."
+  description = "Prod runner credentials secret ARN. Populate it after creating a runner access key."
   value       = module.runtime.runner_credentials_secret_arn
 }

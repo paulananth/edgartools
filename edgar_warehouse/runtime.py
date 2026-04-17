@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -12,18 +13,29 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 
+from edgar_warehouse.artifacts import fetch_filing_artifacts
+from edgar_warehouse.gold import build_gold, write_gold_to_snowflake_export, write_gold_to_storage
 from edgar_warehouse.loaders import (
     stage_address_loader,
     stage_company_loader,
+    stage_daily_index_filing_loader,
     stage_former_name_loader,
     stage_manifest_loader,
     stage_pagination_filing_loader,
     stage_recent_filing_loader,
 )
-from edgar_warehouse.silver import SilverDatabase
+from edgar_warehouse.parsers import ADV_FORMS, OWNERSHIP_FORMS, get_parser
+from edgar_warehouse.reconcile import (
+    build_reconcile_findings,
+    mark_findings_for_resync,
+    mark_findings_resolved,
+)
+from edgar_warehouse.silver import SilverDatabase, _parse_company_ticker_rows
+from edgar_warehouse.text_extraction import extract_text_for_accession
 
 GOLD_AFFECTING_COMMANDS = {
     "bootstrap-full",
@@ -44,30 +56,6 @@ SNOWFLAKE_EXPORT_TABLES = {
     "FILING_DETAIL": "filing_detail",
 }
 
-SNOWFLAKE_METADATA_FIELDS = (
-    "account",
-    "database",
-    "source_schema",
-    "gold_schema",
-    "refresh_warehouse",
-    "runtime_role",
-    "refresher_user",
-    "storage_integration",
-    "stage_name",
-    "file_format_name",
-    "status_table_name",
-    "source_load_procedure",
-    "refresh_procedure",
-)
-
-FORBIDDEN_SNOWFLAKE_METADATA_FIELDS = (
-    "password",
-    "private_key",
-    "token",
-    "secret",
-    "client_secret",
-)
-
 WAREHOUSE_RUNTIME_MODES = {
     "bronze_capture",
     "infrastructure_validation",
@@ -76,6 +64,7 @@ WAREHOUSE_RUNTIME_MODES = {
 _DAILY_INDEX_LINE_PATTERN = re.compile(
     r"^.+?\s{2,}(?P<cik>\d{4,10})\s+(?:\d{8}|\d{4}-\d{2}-\d{2})\s+edgar/data/"
 )
+_ET_ZONE = ZoneInfo("America/New_York")
 
 
 class WarehouseRuntimeError(RuntimeError):
@@ -137,16 +126,9 @@ class WarehouseCommandContext:
     storage_root: StorageLocation
     silver_root: StorageLocation
     snowflake_export_root: StorageLocation | None
+    environment_name: str
     identity: str
     runtime_mode: str
-
-
-@dataclass(frozen=True)
-class SnowflakeSyncContext:
-    """Runtime context shared by Snowflake sync validation commands."""
-
-    export_root: StorageLocation
-    metadata: dict[str, str]
 
 
 def run_command(command_name: str, args: Any) -> int:
@@ -154,13 +136,9 @@ def run_command(command_name: str, args: Any) -> int:
     arguments = _namespace_to_payload(args)
     runtime_mode = os.environ.get("WAREHOUSE_RUNTIME_MODE", "infrastructure_validation").strip() or "infrastructure_validation"
     try:
-        if command_name == "snowflake-sync-after-load":
-            context = _build_snowflake_sync_context()
-            payload = _execute_snowflake_sync(context=context, command_name=command_name, arguments=arguments)
-        else:
-            context = _build_warehouse_context(command_name)
-            runtime_mode = context.runtime_mode
-            payload = _execute_warehouse(context=context, command_name=command_name, arguments=arguments)
+        context = _build_warehouse_context(command_name)
+        runtime_mode = context.runtime_mode
+        payload = _execute_warehouse(context=context, command_name=command_name, arguments=arguments)
     except WarehouseRuntimeError as exc:
         print(json.dumps(_error_payload(command_name, arguments, str(exc), runtime_mode=runtime_mode), indent=2, sort_keys=True))
         return 2
@@ -181,6 +159,7 @@ def _build_warehouse_context(command_name: str) -> WarehouseCommandContext:
         raise WarehouseRuntimeError(
             "WAREHOUSE_RUNTIME_MODE must be one of: " + ", ".join(sorted(WAREHOUSE_RUNTIME_MODES))
         )
+    environment_name = os.environ.get("WAREHOUSE_ENVIRONMENT", "").strip() or "local"
 
     bronze_root_value = os.environ.get("WAREHOUSE_BRONZE_ROOT", "").strip()
     storage_root_value = os.environ.get("WAREHOUSE_STORAGE_ROOT", "").strip()
@@ -221,44 +200,10 @@ def _build_warehouse_context(command_name: str) -> WarehouseCommandContext:
         storage_root=storage_root,
         silver_root=silver_root,
         snowflake_export_root=snowflake_export_root,
+        environment_name=environment_name,
         identity=identity,
         runtime_mode=runtime_mode,
     )
-
-
-def _build_snowflake_sync_context() -> SnowflakeSyncContext:
-    export_root_value = os.environ.get("SNOWFLAKE_EXPORT_ROOT", "").strip()
-    if not export_root_value:
-        raise WarehouseRuntimeError("SNOWFLAKE_EXPORT_ROOT is required for Snowflake sync commands")
-
-    raw_metadata = os.environ.get("SNOWFLAKE_RUNTIME_METADATA", "").strip()
-    if not raw_metadata:
-        raise WarehouseRuntimeError("SNOWFLAKE_RUNTIME_METADATA is required for Snowflake sync commands")
-
-    try:
-        metadata = json.loads(raw_metadata)
-    except json.JSONDecodeError as exc:
-        raise WarehouseRuntimeError("SNOWFLAKE_RUNTIME_METADATA must be valid JSON") from exc
-    if not isinstance(metadata, dict):
-        raise WarehouseRuntimeError("SNOWFLAKE_RUNTIME_METADATA must decode to a JSON object")
-
-    missing = [field for field in SNOWFLAKE_METADATA_FIELDS if not str(metadata.get(field, "")).strip()]
-    if missing:
-        raise WarehouseRuntimeError(
-            "SNOWFLAKE_RUNTIME_METADATA is missing required fields: " + ", ".join(sorted(missing))
-        )
-
-    present_forbidden = sorted(
-        field for field in FORBIDDEN_SNOWFLAKE_METADATA_FIELDS if field in metadata and metadata[field]
-    )
-    if present_forbidden:
-        raise WarehouseRuntimeError(
-            "SNOWFLAKE_RUNTIME_METADATA must not include credential material: "
-            + ", ".join(present_forbidden)
-        )
-
-    normalized = {field: str(metadata[field]).strip() for field in SNOWFLAKE_METADATA_FIELDS}
-    return SnowflakeSyncContext(export_root=StorageLocation(export_root_value), metadata=normalized)
 
 
 def _execute_warehouse(
@@ -333,6 +278,7 @@ def _execute_warehouse_infrastructure_validation(
         "command": command_name,
         "environment": {
             "bronze_root": context.bronze_root.root,
+            "environment_name": context.environment_name,
             "warehouse_root": context.storage_root.root,
             "silver_root": context.silver_root.root,
             "identity_present": True,
@@ -356,33 +302,57 @@ def _execute_warehouse_bronze_capture(
     now = datetime.now(UTC)
     run_id = _resolve_run_id(arguments)
     command_path = command_name.replace("_", "-")
-    scope = _resolve_scope(command_name=command_name, arguments=arguments, now=now)
-
-    raw_writes, silver_staging = _capture_bronze_raw(
-        context=context,
-        command_name=command_name,
-        arguments=arguments,
-        scope=scope,
-        now=now,
+    scope = _resolve_scope(command_name=command_name, arguments=arguments, now=now, silver_root=context.silver_root)
+    db = _open_silver_database(context.silver_root)
+    sync_mode = _sync_mode_for_command(command_name)
+    sync_scope_type = _sync_scope_type_for_command(command_name, scope)
+    db.start_sync_run(
+        {
+            "sync_run_id": run_id,
+            "sync_mode": sync_mode,
+            "scope_type": sync_scope_type,
+            "scope_key": _sync_scope_key_for_command(command_name, scope),
+            "started_at": now,
+            "status": "running",
+        }
     )
 
-    # Write silver layer from staged submissions payloads.
+    raw_writes: list[dict[str, Any]] = []
+    metrics: dict[str, Any] = {"rows_inserted": 0, "rows_skipped": 0, "sync_status": "succeeded"}
+    gold_row_counts: dict[str, int] | None = None
+    snowflake_export_counts: dict[str, int] | None = None
+    snowflake_export_manifest_write: dict[str, Any] | None = None
     silver_table_counts: dict[str, int] | None = None
-    if silver_staging:
-        recent_limit = arguments.get("recent_limit")
-        db = _open_silver_database(context.silver_root)
-        for cik, raw_object_id, main_payload, pagination_payloads in silver_staging:
-            _apply_silver_from_submissions(
-                db=db,
-                sync_run_id=run_id,
-                cik=cik,
-                raw_object_id=raw_object_id,
-                load_mode=command_name.replace("-", "_"),
-                main_payload=main_payload,
-                pagination_payloads=pagination_payloads,
-                recent_limit=recent_limit,
-            )
+    try:
+        raw_writes, metrics = _capture_bronze_raw(
+            context=context,
+            db=db,
+            command_name=command_name,
+            arguments=arguments,
+            scope=scope,
+            now=now,
+            sync_run_id=run_id,
+        )
         silver_table_counts = db.get_table_counts()
+        if context.snowflake_export_root is not None and command_name in GOLD_AFFECTING_COMMANDS:
+            gold_tables = build_gold(db)
+            gold_row_counts = write_gold_to_storage(gold_tables, context.storage_root, run_id)
+            export_business_date = _resolve_export_business_date(command_name=command_name, scope=scope, now=now)
+            snowflake_export_counts = write_gold_to_snowflake_export(
+                gold_tables,
+                context.snowflake_export_root,
+                run_id,
+                export_business_date,
+            )
+        db.complete_sync_run(
+            run_id,
+            status=str(metrics.get("sync_status", "succeeded")),
+            rows_inserted=int(metrics.get("rows_inserted", 0) or 0),
+            rows_skipped=int(metrics.get("rows_skipped", 0) or 0),
+        )
+    except Exception as exc:
+        db.complete_sync_run(run_id, status="failed", error_message=str(exc))
+        raise
 
     writes = []
     for layer, relative_path in _planned_writes(command_name=command_name, command_path=command_path, run_id=run_id, scope=scope).items():
@@ -405,31 +375,27 @@ def _execute_warehouse_bronze_capture(
             }
         )
 
-    snowflake_exports = []
-    if context.snowflake_export_root is not None:
+    if context.snowflake_export_root is not None and command_name in GOLD_AFFECTING_COMMANDS:
         export_business_date = _resolve_export_business_date(command_name=command_name, scope=scope, now=now)
-        for table_name, table_path in SNOWFLAKE_EXPORT_TABLES.items():
-            relative_path = (
-                f"{table_path}/business_date={export_business_date}/run_id={run_id}/manifest.json"
-            )
-            export_manifest = _snowflake_export_manifest(
-                table_name=table_name,
-                command_name=command_name,
-                run_id=run_id,
-                business_date=export_business_date,
-                arguments=arguments,
-                now=now,
-                runtime_mode=context.runtime_mode,
-            )
-            snowflake_exports.append(
-                {
-                    "layer": "snowflake_export",
-                    "path": context.snowflake_export_root.write_json(relative_path, export_manifest),
-                    "relative_path": relative_path,
-                    "table_name": table_name,
-                }
-            )
-        writes.extend(snowflake_exports)
+        run_manifest_relative_path = _snowflake_export_run_manifest_relative_path(
+            workflow_name=command_name.replace("-", "_"),
+            business_date=export_business_date,
+            run_id=run_id,
+        )
+        run_manifest = _snowflake_export_run_manifest(
+            environment_name=context.environment_name,
+            command_name=command_name,
+            run_id=run_id,
+            business_date=export_business_date,
+            now=now,
+            export_counts=snowflake_export_counts or {},
+        )
+        snowflake_export_manifest_write = {
+            "layer": "snowflake_export_manifest",
+            "path": context.snowflake_export_root.write_json(run_manifest_relative_path, run_manifest),
+            "relative_path": run_manifest_relative_path,
+        }
+        writes.append(snowflake_export_manifest_write)
 
     return {
         "arguments": arguments,
@@ -437,6 +403,7 @@ def _execute_warehouse_bronze_capture(
         "command": command_name,
         "environment": {
             "bronze_root": context.bronze_root.root,
+            "environment_name": context.environment_name,
             "warehouse_root": context.storage_root.root,
             "silver_root": context.silver_root.root,
             "identity_present": True,
@@ -445,13 +412,20 @@ def _execute_warehouse_bronze_capture(
         "message": (
             "Warehouse bronze capture completed successfully. "
             "Raw SEC files and run manifests were written to the configured bronze"
-            + (", warehouse, and Snowflake export roots." if context.snowflake_export_root is not None else " and warehouse roots.")
+            + (
+                ", warehouse, and Snowflake export roots."
+                if context.snowflake_export_root is not None else
+                " and warehouse roots."
+            )
         ),
         "raw_writes": raw_writes,
         "run_id": run_id,
         "runtime_mode": context.runtime_mode,
         "scope": scope,
+        "gold_row_counts": gold_row_counts,
         "silver_table_counts": silver_table_counts,
+        "snowflake_export_manifest": snowflake_export_manifest_write,
+        "snowflake_export_row_counts": snowflake_export_counts,
         "started_at": now.isoformat().replace("+00:00", "Z"),
         "status": "ok",
         "writes": writes,
@@ -478,7 +452,7 @@ def _apply_silver_from_submissions(
     main_payload: dict[str, Any],
     pagination_payloads: list[tuple[str, dict[str, Any]]],
     recent_limit: int | None = None,
-) -> None:
+) -> dict[str, Any]:
     """Write silver rows for one company from its parsed submissions JSON payloads."""
     company_rows = stage_company_loader(main_payload, cik, sync_run_id, raw_object_id, load_mode)
     address_rows = stage_address_loader(main_payload, cik, sync_run_id, raw_object_id, load_mode)
@@ -488,142 +462,862 @@ def _apply_silver_from_submissions(
         main_payload, cik, sync_run_id, raw_object_id, load_mode, recent_limit=recent_limit
     )
 
-    db.merge_company(company_rows, sync_run_id)
-    db.merge_addresses(address_rows, sync_run_id)
-    db.merge_former_names(former_name_rows, sync_run_id)
-    db.merge_submission_files(manifest_rows, sync_run_id)
-    db.merge_filings(recent_rows, sync_run_id)
+    db._conn.execute("DELETE FROM sec_company_former_name WHERE cik = ?", [cik])
+    db._conn.execute("DELETE FROM sec_company_submission_file WHERE cik = ?", [cik])
+    rows_written = 0
+    rows_written += db.merge_company(company_rows, sync_run_id)
+    rows_written += db.merge_addresses(address_rows, sync_run_id)
+    rows_written += db.merge_former_names(former_name_rows, sync_run_id)
+    rows_written += db.merge_submission_files(manifest_rows, sync_run_id)
+    rows_written += db.merge_filings(recent_rows, sync_run_id)
 
+    pagination_accessions: list[str] = []
     for _file_name, pagination_payload in pagination_payloads:
         pagination_rows = stage_pagination_filing_loader(pagination_payload, cik, sync_run_id, raw_object_id, load_mode)
-        db.merge_filings(pagination_rows, sync_run_id)
+        rows_written += db.merge_filings(pagination_rows, sync_run_id)
+        pagination_accessions.extend(
+            row["accession_number"]
+            for row in pagination_rows
+            if row.get("accession_number")
+        )
+    return {
+        "rows_written": rows_written,
+        "recent_rows": recent_rows,
+        "manifest_rows": manifest_rows,
+        "recent_accessions": [
+            row["accession_number"]
+            for row in recent_rows
+            if row.get("accession_number")
+        ],
+        "pagination_accessions": pagination_accessions,
+    }
 
 
 def _capture_bronze_raw(
     context: WarehouseCommandContext,
+    db: SilverDatabase,
     command_name: str,
     arguments: dict[str, Any],
     scope: dict[str, Any],
     now: datetime,
-) -> tuple[list[dict[str, Any]], list[tuple[int, str, dict[str, Any], list[tuple[str, dict[str, Any]]]]]]:
-    """Capture raw bronze objects and return (write_records, silver_staging).
-
-    silver_staging is a list of (cik, raw_object_id, main_payload, pagination_payloads)
-    tuples suitable for passing to _apply_silver_from_submissions.
-    """
+    sync_run_id: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Capture and apply bronze/silver workflow state for a warehouse command."""
     raw_writes: list[dict[str, Any]] = []
-    silver_staging: list[tuple[int, str, dict[str, Any], list[tuple[str, dict[str, Any]]]]] = []
+    metrics: dict[str, Any] = {"rows_inserted": 0, "rows_skipped": 0, "sync_status": "succeeded"}
 
     if arguments.get("include_reference_refresh"):
-        raw_writes.extend(_capture_reference_files(context=context, fetch_date=now.date()))
+        reference_result = _sync_reference_data(
+            context=context,
+            db=db,
+            sync_run_id=sync_run_id,
+            fetch_date=now.date(),
+        )
+        raw_writes.extend(reference_result["raw_writes"])
+        metrics["rows_inserted"] += reference_result["rows_written"]
+        metrics["rows_skipped"] += reference_result["rows_skipped"]
 
     if command_name == "daily-incremental":
-        db = _open_silver_database(context.silver_root)
         impacted_ciks: list[int] = []
         for target_date in _date_range(
             start=date.fromisoformat(scope["business_date_start"]),
             end=date.fromisoformat(scope["business_date_end"]),
         ):
-            try:
-                daily_index_write, daily_index_ciks = _capture_daily_index_file(context=context, target_date=target_date)
-                raw_writes.append(daily_index_write)
-                impacted_ciks.extend(daily_index_ciks)
-                db.upsert_daily_index_checkpoint({
-                    "business_date": target_date.isoformat(),
-                    "source_key": f"date:{target_date.isoformat()}",
-                    "source_url": _build_daily_index_url(target_date),
-                    "expected_available_at": _expected_available_at(target_date),
-                    "last_attempt_at": now,
-                    "last_success_at": now,
-                    "raw_object_id": daily_index_write["sha256"],
-                    "last_sha256": daily_index_write["sha256"],
-                    "row_count": len(daily_index_ciks),
-                    "status": "succeeded",
-                })
-            except WarehouseRuntimeError as exc:
-                db.upsert_daily_index_checkpoint({
-                    "business_date": target_date.isoformat(),
-                    "source_key": f"date:{target_date.isoformat()}",
-                    "source_url": _build_daily_index_url(target_date),
-                    "expected_available_at": _expected_available_at(target_date),
-                    "last_attempt_at": now,
-                    "status": "failed_retryable",
-                    "error_message": str(exc),
-                })
-                raise  # fail-fast: stop processing remaining dates on first fetch failure
+            result = _load_daily_index_for_date(
+                context=context,
+                db=db,
+                target_date=target_date,
+                sync_run_id=sync_run_id,
+                now=now,
+                force=bool(arguments.get("force")),
+            )
+            raw_writes.extend(result["raw_writes"])
+            metrics["rows_inserted"] += result["rows_written"]
+            metrics["rows_skipped"] += result["rows_skipped"]
+            impacted_ciks.extend(result["impacted_ciks"])
+            if result["status"] in {"waiting_for_publish", "failed_retryable"}:
+                metrics["sync_status"] = "partial"
+                break
         impacted_ciks = _dedupe_ints(impacted_ciks)
+        db.auto_enroll_tracked_universe(impacted_ciks, scope_reason="daily_index")
         impacted_ciks = _filter_ciks_to_universe(impacted_ciks, db)
         selected_ciks = _apply_bronze_cik_limit(impacted_ciks)
         if selected_ciks:
-            writes, staging = _capture_submissions_scope(
-                context=context,
-                ciks=selected_ciks,
-                include_pagination=False,
-                fetch_date=now.date(),
-            )
-            raw_writes.extend(writes)
-            silver_staging.extend(staging)
-        return raw_writes, silver_staging
+            for cik in selected_ciks:
+                result = submissions_orchestrator(
+                    context=context,
+                    db=db,
+                    sync_run_id=sync_run_id,
+                    cik=cik,
+                    include_pagination=False,
+                    fetch_date=now.date(),
+                    force=bool(arguments.get("force")),
+                    load_mode="daily_incremental",
+                )
+                raw_writes.extend(result["raw_writes"])
+                metrics["rows_inserted"] += result["rows_written"]
+                metrics["rows_skipped"] += result["rows_skipped"]
+        return raw_writes, metrics
 
     if command_name == "load-daily-form-index-for-date":
-        daily_index_write, _ = _capture_daily_index_file(context=context, target_date=date.fromisoformat(scope["target_date"]))
-        raw_writes.append(daily_index_write)
-        return raw_writes, silver_staging
+        result = _load_daily_index_for_date(
+            context=context,
+            db=db,
+            target_date=date.fromisoformat(scope["target_date"]),
+            sync_run_id=sync_run_id,
+            now=now,
+            force=bool(arguments.get("force")),
+        )
+        raw_writes.extend(result["raw_writes"])
+        metrics["rows_inserted"] += result["rows_written"]
+        metrics["rows_skipped"] += result["rows_skipped"]
+        if result["status"] in {"waiting_for_publish", "failed_retryable"}:
+            metrics["sync_status"] = "partial"
+        return raw_writes, metrics
 
     if command_name == "bootstrap-recent-10":
-        ciks = _require_cik_list(scope.get("cik_list"), command_name)
-        writes, staging = _capture_submissions_scope(
-            context=context, ciks=ciks, include_pagination=False, fetch_date=now.date()
+        ciks = _resolve_target_ciks(
+            db=db,
+            raw_ciks=scope.get("cik_list"),
+            command_name=command_name,
+            tracking_status_filter=str(scope.get("tracking_status_filter", "active")),
         )
-        raw_writes.extend(writes)
-        silver_staging.extend(staging)
-        return raw_writes, silver_staging
+        for cik in ciks:
+            result = submissions_orchestrator(
+                context=context,
+                db=db,
+                sync_run_id=sync_run_id,
+                cik=cik,
+                include_pagination=False,
+                fetch_date=now.date(),
+                force=bool(arguments.get("force")),
+                load_mode="bootstrap_recent_10",
+                recent_limit=arguments.get("recent_limit"),
+            )
+            raw_writes.extend(result["raw_writes"])
+            metrics["rows_inserted"] += result["rows_written"]
+            metrics["rows_skipped"] += result["rows_skipped"]
+        return raw_writes, metrics
 
     if command_name == "bootstrap-full":
-        ciks = _require_cik_list(scope.get("cik_list"), command_name)
-        writes, staging = _capture_submissions_scope(
-            context=context, ciks=ciks, include_pagination=True, fetch_date=now.date()
+        ciks = _resolve_target_ciks(
+            db=db,
+            raw_ciks=scope.get("cik_list"),
+            command_name=command_name,
+            tracking_status_filter=str(scope.get("tracking_status_filter", "active")),
         )
-        raw_writes.extend(writes)
-        silver_staging.extend(staging)
-        return raw_writes, silver_staging
+        for cik in ciks:
+            result = submissions_orchestrator(
+                context=context,
+                db=db,
+                sync_run_id=sync_run_id,
+                cik=cik,
+                include_pagination=True,
+                fetch_date=now.date(),
+                force=bool(arguments.get("force")),
+                load_mode="bootstrap_full",
+            )
+            raw_writes.extend(result["raw_writes"])
+            metrics["rows_inserted"] += result["rows_written"]
+            metrics["rows_skipped"] += result["rows_skipped"]
+        return raw_writes, metrics
 
     if command_name == "targeted-resync":
         scope_type = str(scope.get("scope_type", "")).strip()
         scope_key = str(scope.get("scope_key", "")).strip()
         if scope_type == "reference":
-            return raw_writes, silver_staging
-        if scope_type == "cik":
-            writes, staging = _capture_submissions_scope(
+            reference_result = _sync_reference_data(
                 context=context,
-                ciks=[_parse_cik(scope_key)],
+                db=db,
+                sync_run_id=sync_run_id,
+                fetch_date=now.date(),
+                source_names=_reference_sources_for_scope(scope_key),
+            )
+            raw_writes.extend(reference_result["raw_writes"])
+            metrics["rows_inserted"] += reference_result["rows_written"]
+            metrics["rows_skipped"] += reference_result["rows_skipped"]
+            return raw_writes, metrics
+        if scope_type == "cik":
+            result = submissions_orchestrator(
+                context=context,
+                db=db,
+                sync_run_id=sync_run_id,
+                cik=_parse_cik(scope_key),
                 include_pagination=True,
                 fetch_date=now.date(),
+                force=bool(arguments.get("force", True)),
+                load_mode="targeted_resync",
             )
-            raw_writes.extend(writes)
-            silver_staging.extend(staging)
-            return raw_writes, silver_staging
-        raise WarehouseRuntimeError("targeted-resync in bronze_capture mode does not yet support accession scope")
+            raw_writes.extend(result["raw_writes"])
+            metrics["rows_inserted"] += result["rows_written"]
+            metrics["rows_skipped"] += result["rows_skipped"]
+            if arguments.get("include_artifacts") or arguments.get("include_text") or arguments.get("include_parsers"):
+                for accession_number in result["recent_accessions"]:
+                    pipeline_result = _run_accession_resync(
+                        context=context,
+                        db=db,
+                        sync_run_id=sync_run_id,
+                        accession_number=accession_number,
+                        include_artifacts=bool(arguments.get("include_artifacts", True)),
+                        include_text=bool(arguments.get("include_text", True)),
+                        include_parsers=bool(arguments.get("include_parsers", True)),
+                        force=bool(arguments.get("force", True)),
+                    )
+                    raw_writes.extend(pipeline_result["raw_writes"])
+                    metrics["rows_inserted"] += pipeline_result["rows_written"]
+            return raw_writes, metrics
+        if scope_type == "accession":
+            pipeline_result = _run_accession_resync(
+                context=context,
+                db=db,
+                sync_run_id=sync_run_id,
+                accession_number=scope_key,
+                include_artifacts=bool(arguments.get("include_artifacts", True)),
+                include_text=bool(arguments.get("include_text", True)),
+                include_parsers=bool(arguments.get("include_parsers", True)),
+                force=bool(arguments.get("force", True)),
+            )
+            raw_writes.extend(pipeline_result["raw_writes"])
+            metrics["rows_inserted"] += pipeline_result["rows_written"]
+            return raw_writes, metrics
+        raise WarehouseRuntimeError(f"Unsupported targeted-resync scope_type: {scope_type}")
 
     if command_name == "full-reconcile":
-        ciks = _require_cik_list(scope.get("cik_list"), command_name)
-        writes, staging = _capture_submissions_scope(
-            context=context, ciks=ciks, include_pagination=True, fetch_date=now.date()
+        ciks = _resolve_reconcile_ciks(
+            db=db,
+            raw_ciks=scope.get("cik_list"),
+            sample_limit=scope.get("sample_limit"),
         )
-        raw_writes.extend(writes)
-        silver_staging.extend(staging)
-        return raw_writes, silver_staging
+        all_findings: list[dict[str, Any]] = []
+        for cik in ciks:
+            snapshot = _capture_reconcile_snapshot(
+                context=context,
+                cik=cik,
+                fetch_date=now.date(),
+            )
+            raw_writes.append(snapshot["write_record"])
+            findings = build_reconcile_findings(
+                db=db,
+                cik=cik,
+                sync_run_id=sync_run_id,
+                submissions_payload=snapshot["payload"],
+            )
+            all_findings.extend(findings)
+        if all_findings:
+            db.insert_reconcile_findings(all_findings)
+            metrics["rows_inserted"] += len(all_findings)
+        if scope.get("auto_heal"):
+            healed_rows = mark_findings_for_resync(all_findings, resync_run_id=sync_run_id)
+            if healed_rows:
+                db.insert_reconcile_findings(healed_rows)
+            resolved_rows: list[dict[str, Any]] = []
+            for row in healed_rows:
+                if row["recommended_action"] == "accession_resync":
+                    _run_accession_resync(
+                        context=context,
+                        db=db,
+                        sync_run_id=sync_run_id,
+                        accession_number=row["object_key"],
+                        include_artifacts=True,
+                        include_text=True,
+                        include_parsers=True,
+                        force=True,
+                    )
+                else:
+                    submissions_orchestrator(
+                        context=context,
+                        db=db,
+                        sync_run_id=sync_run_id,
+                        cik=int(row["cik"]),
+                        include_pagination=True,
+                        fetch_date=now.date(),
+                        force=True,
+                        load_mode="targeted_resync",
+                    )
+                resolved_rows.append(row)
+            if resolved_rows:
+                db.insert_reconcile_findings(mark_findings_resolved(resolved_rows, resync_run_id=sync_run_id))
+        return raw_writes, metrics
 
     if command_name == "catch-up-daily-form-index":
         end_date = date.fromisoformat(scope["end_date"])
-        writes, staging = _capture_catch_up_daily_form_index(
-            context=context, end_date=end_date
+        result = _capture_catch_up_daily_form_index(
+            context=context,
+            db=db,
+            sync_run_id=sync_run_id,
+            end_date=end_date,
+            now=now,
+            force=bool(arguments.get("force")),
         )
-        raw_writes.extend(writes)
-        silver_staging.extend(staging)
-        return raw_writes, silver_staging
+        raw_writes.extend(result["raw_writes"])
+        metrics["rows_inserted"] += result["rows_written"]
+        metrics["rows_skipped"] += result["rows_skipped"]
+        if result["status"] == "partial":
+            metrics["sync_status"] = "partial"
+        return raw_writes, metrics
 
     raise WarehouseRuntimeError(f"bronze_capture mode does not support {command_name}")
+
+
+def submissions_orchestrator(
+    *,
+    context: WarehouseCommandContext,
+    db: SilverDatabase,
+    sync_run_id: str,
+    cik: int,
+    include_pagination: bool,
+    fetch_date: date,
+    force: bool,
+    load_mode: str,
+    recent_limit: int | None = None,
+) -> dict[str, Any]:
+    """Fetch one submissions main file, stage rowsets, and merge silver state."""
+    raw_writes: list[dict[str, Any]] = []
+    rows_written = 0
+    rows_skipped = 0
+    now = datetime.now(UTC)
+    existing_state = db.get_company_sync_state(cik) or {"tracking_status": "bootstrap_pending"}
+
+    main_snapshot = _capture_submissions_main(context=context, cik=cik, fetch_date=fetch_date)
+    raw_writes.append(main_snapshot["write_record"])
+    main_payload = main_snapshot["payload"]
+    pagination_payloads: list[tuple[str, dict[str, Any]]] = []
+    pagination_write_records: list[dict[str, Any]] = []
+    pagination_same = True
+
+    manifest_file_names = _pagination_file_names(main_payload) if include_pagination else []
+    for file_name in manifest_file_names:
+        pagination_snapshot = _capture_submissions_pagination(
+            context=context,
+            cik=cik,
+            file_name=file_name,
+            fetch_date=fetch_date,
+        )
+        pagination_write_records.append(pagination_snapshot["write_record"])
+        raw_writes.append(pagination_snapshot["write_record"])
+        pagination_payloads.append((file_name, pagination_snapshot["payload"]))
+        checkpoint = db.get_source_checkpoint("submissions_pagination", f"file:{file_name}")
+        if force or checkpoint is None or checkpoint.get("last_sha256") != pagination_snapshot["write_record"]["sha256"]:
+            pagination_same = False
+
+    main_checkpoint = db.get_source_checkpoint("submissions_main", f"cik:{cik}")
+    main_same = (
+        (not force)
+        and main_checkpoint is not None
+        and main_checkpoint.get("last_sha256") == main_snapshot["write_record"]["sha256"]
+    )
+    all_same = main_same and pagination_same
+
+    for write_record in [main_snapshot["write_record"], *pagination_write_records]:
+        source_name = write_record["source_name"]
+        source_key = f"cik:{cik}" if source_name == "submissions_main" else f"file:{Path(write_record['relative_path']).name}"
+        db.upsert_source_checkpoint(
+            {
+                "source_name": source_name,
+                "source_key": source_key,
+                "raw_object_id": write_record["sha256"],
+                "last_success_at": now,
+                "last_sha256": write_record["sha256"],
+            }
+        )
+
+    result: dict[str, Any]
+    if all_same:
+        rows_skipped = 1 + len(pagination_payloads)
+        recent_rows = stage_recent_filing_loader(
+            main_payload,
+            cik,
+            sync_run_id,
+            main_snapshot["write_record"]["sha256"],
+            load_mode,
+            recent_limit=recent_limit,
+        )
+        result = {
+            "rows_written": 0,
+            "recent_rows": recent_rows,
+            "manifest_rows": stage_manifest_loader(main_payload, cik, sync_run_id, main_snapshot["write_record"]["sha256"], load_mode),
+            "recent_accessions": [
+                row["accession_number"]
+                for row in recent_rows
+                if row.get("accession_number")
+            ],
+            "pagination_accessions": [],
+        }
+    else:
+        result = _apply_silver_from_submissions(
+            db=db,
+            sync_run_id=sync_run_id,
+            cik=cik,
+            raw_object_id=main_snapshot["write_record"]["sha256"],
+            load_mode=load_mode,
+            main_payload=main_payload,
+            pagination_payloads=pagination_payloads,
+            recent_limit=recent_limit,
+        )
+        rows_written += int(result["rows_written"])
+
+    all_filing_rows = list(result["recent_rows"])
+    for _file_name, pagination_payload in pagination_payloads:
+        all_filing_rows.extend(
+            stage_pagination_filing_loader(
+                pagination_payload,
+                cik,
+                sync_run_id,
+                main_snapshot["write_record"]["sha256"],
+                load_mode,
+            )
+        )
+
+    latest_filing_date = _latest_filing_date(all_filing_rows)
+    latest_acceptance_datetime = _latest_acceptance_datetime(all_filing_rows)
+    pagination_files_expected = len(manifest_file_names)
+    pagination_files_loaded = len(manifest_file_names) if include_pagination else 0
+    bootstrap_completed_at = existing_state.get("bootstrap_completed_at")
+    pagination_completed_at = existing_state.get("pagination_completed_at")
+    tracking_status = existing_state.get("tracking_status", "active")
+    if load_mode == "bootstrap_full":
+        tracking_status = "bootstrap_pending"
+        if include_pagination and pagination_files_loaded == pagination_files_expected:
+            tracking_status = "active"
+            bootstrap_completed_at = now
+            pagination_completed_at = now
+    elif tracking_status == "bootstrap_pending" and include_pagination and pagination_files_loaded == pagination_files_expected:
+        tracking_status = "active"
+        bootstrap_completed_at = bootstrap_completed_at or now
+        pagination_completed_at = now
+    elif tracking_status not in {"active", "paused", "historical_complete", "error"}:
+        tracking_status = "active"
+
+    db.upsert_company_sync_state(
+        {
+            "cik": cik,
+            "tracking_status": tracking_status,
+            "bootstrap_completed_at": bootstrap_completed_at,
+            "last_main_sync_at": now,
+            "last_main_raw_object_id": main_snapshot["write_record"]["sha256"],
+            "last_main_sha256": main_snapshot["write_record"]["sha256"],
+            "latest_filing_date_seen": latest_filing_date,
+            "latest_acceptance_datetime_seen": latest_acceptance_datetime,
+            "pagination_files_expected": pagination_files_expected if include_pagination else 0,
+            "pagination_files_loaded": pagination_files_loaded if include_pagination else 0,
+            "pagination_completed_at": pagination_completed_at,
+            "next_sync_after": now + timedelta(days=1),
+            "last_error_message": None,
+        }
+    )
+    return {
+        "raw_writes": raw_writes,
+        "rows_written": rows_written,
+        "rows_skipped": rows_skipped,
+        "recent_accessions": _dedupe_strings(result["recent_accessions"]),
+        "pagination_accessions": _dedupe_strings(result["pagination_accessions"]),
+    }
+
+
+def _sync_reference_data(
+    *,
+    context: WarehouseCommandContext,
+    db: SilverDatabase,
+    sync_run_id: str,
+    fetch_date: date,
+    source_names: list[str] | None = None,
+) -> dict[str, Any]:
+    selected_sources = source_names or ["company_tickers", "company_tickers_exchange"]
+    day_parts = fetch_date.strftime("%Y/%m/%d")
+    raw_writes: list[dict[str, Any]] = []
+    rows_written = 0
+    rows_skipped = 0
+    seed_document: dict[str, Any] | None = None
+    now = datetime.now(UTC)
+
+    definitions = {
+        "company_tickers": (
+            _build_company_tickers_url(),
+            f"reference/sec/company_tickers/{day_parts}/company_tickers.json",
+        ),
+        "company_tickers_exchange": (
+            _build_company_tickers_exchange_url(),
+            f"reference/sec/company_tickers_exchange/{day_parts}/company_tickers_exchange.json",
+        ),
+    }
+
+    for source_name in selected_sources:
+        if source_name not in definitions:
+            raise WarehouseRuntimeError(f"Unsupported reference scope_key: {source_name}")
+        source_url, relative_path = definitions[source_name]
+        payload = _download_sec_bytes(url=source_url, identity=context.identity)
+        write_record = _write_bronze_object(
+            context=context,
+            relative_path=relative_path,
+            source_name=source_name,
+            source_url=source_url,
+            payload=payload,
+        )
+        raw_writes.append(write_record)
+        document = _decode_json_bytes(payload, source_url)
+        rows = _parse_company_ticker_rows(document)
+        checkpoint = db.get_source_checkpoint(source_name, "global")
+        if checkpoint and checkpoint.get("last_sha256") == write_record["sha256"]:
+            rows_skipped += 1
+        else:
+            rows_written += db.replace_company_tickers(rows, sync_run_id, source_name=source_name)
+        db.upsert_source_checkpoint(
+            {
+                "source_name": source_name,
+                "source_key": "global",
+                "raw_object_id": write_record["sha256"],
+                "last_success_at": now,
+                "last_sha256": write_record["sha256"],
+            }
+        )
+        if rows and (source_name == "company_tickers_exchange" or seed_document is None):
+            seed_document = document
+        for row in rows:
+            existing = db.get_company_sync_state(int(row["cik"]))
+            db.upsert_company_sync_state(
+                {
+                    "cik": int(row["cik"]),
+                    "tracking_status": existing.get("tracking_status", "bootstrap_pending") if existing else "bootstrap_pending",
+                    "last_error_message": None,
+                }
+            )
+
+    if seed_document is not None:
+        db.seed_tracked_universe(seed_document)
+    return {"raw_writes": raw_writes, "rows_written": rows_written, "rows_skipped": rows_skipped}
+
+
+def _reference_sources_for_scope(scope_key: str) -> list[str]:
+    normalized = scope_key.strip().lower()
+    if normalized in {"", "all", "reference"}:
+        return ["company_tickers", "company_tickers_exchange"]
+    if normalized in {"company_tickers", "company_tickers_exchange"}:
+        return [normalized]
+    raise WarehouseRuntimeError(f"Unsupported reference scope_key: {scope_key}")
+
+
+def _capture_submissions_main(
+    *,
+    context: WarehouseCommandContext,
+    cik: int,
+    fetch_date: date,
+) -> dict[str, Any]:
+    day_parts = fetch_date.strftime("%Y/%m/%d")
+    main_file_name = f"CIK{cik:010d}.json"
+    main_url = _build_submissions_url(cik)
+    main_payload_bytes = _download_sec_bytes(url=main_url, identity=context.identity)
+    write_record = _write_bronze_object(
+        context=context,
+        relative_path=f"submissions/sec/cik={cik}/main/{day_parts}/{main_file_name}",
+        source_name="submissions_main",
+        source_url=main_url,
+        payload=main_payload_bytes,
+        cik=cik,
+    )
+    return {
+        "payload": _decode_json_bytes(main_payload_bytes, main_url),
+        "write_record": write_record,
+    }
+
+
+def _capture_submissions_pagination(
+    *,
+    context: WarehouseCommandContext,
+    cik: int,
+    file_name: str,
+    fetch_date: date,
+) -> dict[str, Any]:
+    day_parts = fetch_date.strftime("%Y/%m/%d")
+    pagination_url = _build_submission_pagination_url(file_name)
+    payload_bytes = _download_sec_bytes(url=pagination_url, identity=context.identity)
+    write_record = _write_bronze_object(
+        context=context,
+        relative_path=f"submissions/sec/cik={cik}/pagination/{day_parts}/{file_name}",
+        source_name="submissions_pagination",
+        source_url=pagination_url,
+        payload=payload_bytes,
+        cik=cik,
+    )
+    return {
+        "payload": _decode_json_bytes(payload_bytes, pagination_url),
+        "write_record": write_record,
+    }
+
+
+def _capture_reconcile_snapshot(
+    *,
+    context: WarehouseCommandContext,
+    cik: int,
+    fetch_date: date,
+) -> dict[str, Any]:
+    snapshot = _capture_submissions_main(context=context, cik=cik, fetch_date=fetch_date)
+    snapshot["write_record"]["source_name"] = "submissions_main"
+    return snapshot
+
+
+def _load_daily_index_for_date(
+    *,
+    context: WarehouseCommandContext,
+    db: SilverDatabase,
+    target_date: date,
+    sync_run_id: str,
+    now: datetime,
+    force: bool,
+) -> dict[str, Any]:
+    source_url = _build_daily_index_url(target_date)
+    expected_available_at = _expected_available_at(target_date)
+    existing = db.get_daily_index_checkpoint(target_date.isoformat())
+    first_attempt_at = existing.get("first_attempt_at") if existing else now
+
+    if not _is_business_day(target_date):
+        db.upsert_daily_index_checkpoint(
+            {
+                "business_date": target_date.isoformat(),
+                "source_key": f"date:{target_date.isoformat()}",
+                "source_url": source_url,
+                "expected_available_at": expected_available_at,
+                "first_attempt_at": first_attempt_at,
+                "last_attempt_at": now,
+                "status": "skipped_non_business_day",
+                "finalized_at": now,
+            }
+        )
+        return {
+            "raw_writes": [],
+            "rows_written": 0,
+            "rows_skipped": 1,
+            "impacted_ciks": [],
+            "status": "skipped_non_business_day",
+        }
+
+    if not force and existing and existing.get("status") == "succeeded":
+        rows = db.get_daily_index_filings(target_date.isoformat())
+        return {
+            "raw_writes": [],
+            "rows_written": 0,
+            "rows_skipped": 1,
+            "impacted_ciks": _dedupe_ints([int(row["cik"]) for row in rows if row.get("cik") is not None]),
+            "status": "succeeded",
+        }
+
+    if now < expected_available_at:
+        db.upsert_daily_index_checkpoint(
+            {
+                "business_date": target_date.isoformat(),
+                "source_key": f"date:{target_date.isoformat()}",
+                "source_url": source_url,
+                "expected_available_at": expected_available_at,
+                "first_attempt_at": first_attempt_at,
+                "last_attempt_at": now,
+                "status": "waiting_for_publish",
+            }
+        )
+        return {
+            "raw_writes": [],
+            "rows_written": 0,
+            "rows_skipped": 1,
+            "impacted_ciks": [],
+            "status": "waiting_for_publish",
+        }
+
+    db.upsert_daily_index_checkpoint(
+        {
+            "business_date": target_date.isoformat(),
+            "source_key": f"date:{target_date.isoformat()}",
+            "source_url": source_url,
+            "expected_available_at": expected_available_at,
+            "first_attempt_at": first_attempt_at,
+            "last_attempt_at": now,
+            "status": "running",
+        }
+    )
+    try:
+        payload = _download_sec_bytes(url=source_url, identity=context.identity)
+        date_parts = target_date.strftime("%Y/%m/%d")
+        file_name = f"form.{target_date:%Y%m%d}.idx"
+        write_record = _write_bronze_object(
+            context=context,
+            relative_path=f"daily_index/sec/{date_parts}/{file_name}",
+            source_name="daily_index",
+            source_url=source_url,
+            payload=payload,
+            business_date=target_date.isoformat(),
+        )
+        rows = stage_daily_index_filing_loader(
+            payload=payload,
+            business_date=target_date,
+            sync_run_id=sync_run_id,
+            raw_object_id=write_record["sha256"],
+            source_url=source_url,
+        )
+        row_count = db.merge_daily_index_filings(rows, sync_run_id)
+        distinct_cik_count = len({int(row["cik"]) for row in rows if row.get("cik") is not None})
+        distinct_accession_count = len({row["accession_number"] for row in rows if row.get("accession_number")})
+        db.upsert_daily_index_checkpoint(
+            {
+                "business_date": target_date.isoformat(),
+                "source_key": f"date:{target_date.isoformat()}",
+                "source_url": source_url,
+                "expected_available_at": expected_available_at,
+                "first_attempt_at": first_attempt_at,
+                "last_attempt_at": now,
+                "raw_object_id": write_record["sha256"],
+                "last_sha256": write_record["sha256"],
+                "row_count": row_count,
+                "distinct_cik_count": distinct_cik_count,
+                "distinct_accession_count": distinct_accession_count,
+                "status": "succeeded",
+                "finalized_at": now,
+                "last_success_at": now,
+            }
+        )
+        return {
+            "raw_writes": [write_record],
+            "rows_written": row_count,
+            "rows_skipped": 0,
+            "impacted_ciks": _dedupe_ints([int(row["cik"]) for row in rows if row.get("cik") is not None]),
+            "status": "succeeded",
+        }
+    except WarehouseRuntimeError as exc:
+        db.upsert_daily_index_checkpoint(
+            {
+                "business_date": target_date.isoformat(),
+                "source_key": f"date:{target_date.isoformat()}",
+                "source_url": source_url,
+                "expected_available_at": expected_available_at,
+                "first_attempt_at": first_attempt_at,
+                "last_attempt_at": now,
+                "status": "failed_retryable",
+                "error_message": str(exc),
+            }
+        )
+        return {
+            "raw_writes": [],
+            "rows_written": 0,
+            "rows_skipped": 0,
+            "impacted_ciks": [],
+            "status": "failed_retryable",
+        }
+
+
+def _run_accession_resync(
+    *,
+    context: WarehouseCommandContext,
+    db: SilverDatabase,
+    sync_run_id: str,
+    accession_number: str,
+    include_artifacts: bool,
+    include_text: bool,
+    include_parsers: bool,
+    force: bool,
+) -> dict[str, Any]:
+    raw_writes: list[dict[str, Any]] = []
+    rows_written = 0
+    filing = db.get_filing(accession_number)
+    if filing is None:
+        raise WarehouseRuntimeError(f"Unknown accession_number for targeted resync: {accession_number}")
+
+    rows_written += db.merge_filings([filing], sync_run_id)
+    if include_artifacts:
+        artifact_result = fetch_filing_artifacts(
+            context=context,
+            db=db,
+            accession_number=accession_number,
+            sync_run_id=sync_run_id,
+            download_bytes=_download_sec_bytes,
+            force=force,
+        )
+        raw_writes.extend(artifact_result["raw_writes"])
+        rows_written += int(artifact_result["attachment_count"])
+    if include_text:
+        text_row = extract_text_for_accession(context=context, db=db, accession_number=accession_number)
+        rows_written += 1 if text_row else 0
+    if include_parsers:
+        rows_written += _run_parse_pipeline(db=db, accession_number=accession_number, sync_run_id=sync_run_id)
+    return {"raw_writes": raw_writes, "rows_written": rows_written}
+
+
+def _run_parse_pipeline(
+    *,
+    db: SilverDatabase,
+    accession_number: str,
+    sync_run_id: str,
+) -> int:
+    filing = db.get_filing(accession_number)
+    if filing is None:
+        return 0
+    form_type = str(filing.get("form") or "").strip()
+    parser_name, parser_version, form_family = _parser_metadata(form_type)
+    parse_run_id = str(uuid.uuid4())
+    db.start_parse_run(
+        {
+            "parse_run_id": parse_run_id,
+            "accession_number": accession_number,
+            "parser_name": parser_name,
+            "parser_version": parser_version,
+            "target_form_family": form_family,
+        }
+    )
+
+    try:
+        if form_family == "generic":
+            db.complete_parse_run(parse_run_id, status="skipped", rows_written=0)
+            return 0
+        payload = _read_primary_artifact_bytes(db, accession_number)
+        parser = get_parser(form_type)
+        content = payload.decode("utf-8", errors="replace")
+        if form_family == "ownership":
+            parsed = parser(accession_number, content, form_type)
+        else:
+            parsed = parser(accession_number, content, form_type, filing.get("cik"))
+        rows_written = 0
+        rows_written += db.merge_ownership_reporting_owners(parsed.get("sec_ownership_reporting_owner", []), sync_run_id)
+        rows_written += db.merge_ownership_non_derivative_txns(parsed.get("sec_ownership_non_derivative_txn", []), sync_run_id)
+        rows_written += db.merge_ownership_derivative_txns(parsed.get("sec_ownership_derivative_txn", []), sync_run_id)
+        rows_written += db.merge_adv_filings(parsed.get("sec_adv_filing", []), sync_run_id)
+        rows_written += db.merge_adv_offices(parsed.get("sec_adv_office", []), sync_run_id)
+        rows_written += db.merge_adv_disclosure_events(parsed.get("sec_adv_disclosure_event", []), sync_run_id)
+        rows_written += db.merge_adv_private_funds(parsed.get("sec_adv_private_fund", []), sync_run_id)
+        db.complete_parse_run(parse_run_id, status="succeeded", rows_written=rows_written)
+        return rows_written
+    except Exception as exc:
+        db.complete_parse_run(
+            parse_run_id,
+            status="failed",
+            error_code="parse_failed",
+            error_message=str(exc),
+            rows_written=0,
+        )
+        return 0
+
+
+def _read_primary_artifact_bytes(db: SilverDatabase, accession_number: str) -> bytes:
+    attachments = db.get_filing_attachments(accession_number)
+    primary = next((row for row in attachments if row.get("is_primary")), None)
+    if primary is None or not primary.get("raw_object_id"):
+        raise WarehouseRuntimeError(f"No primary attachment found for accession {accession_number}")
+    raw_object = db.get_raw_object(str(primary["raw_object_id"]))
+    if raw_object is None:
+        raise WarehouseRuntimeError(f"Missing raw object for accession {accession_number}")
+    storage_path = str(raw_object["storage_path"])
+    if "://" in storage_path:
+        protocol = storage_path.split("://", 1)[0]
+        import fsspec
+
+        fs = fsspec.filesystem(protocol)
+        with fs.open(storage_path, "rb") as handle:
+            return handle.read()
+    return Path(storage_path).read_bytes()
+
+
+def _parser_metadata(form_type: str) -> tuple[str, str, str]:
+    if form_type in OWNERSHIP_FORMS:
+        module = importlib.import_module("edgar_warehouse.parsers.ownership")
+        return str(module.PARSER_NAME), str(module.PARSER_VERSION), "ownership"
+    if form_type in ADV_FORMS:
+        module = importlib.import_module("edgar_warehouse.parsers.adv")
+        return str(module.PARSER_NAME), str(module.PARSER_VERSION), "adv"
+    return "generic_text_v1", "1", "generic"
 
 
 def _capture_reference_files(context: WarehouseCommandContext, fetch_date: date) -> list[dict[str, Any]]:
@@ -723,78 +1417,58 @@ def _capture_submissions_scope(
 
 def _capture_catch_up_daily_form_index(
     context: WarehouseCommandContext,
+    db: SilverDatabase,
+    sync_run_id: str,
     end_date: date,
-) -> tuple[list[dict[str, Any]], list]:
-    """Fetch missing daily index files in ascending date order up to end_date.
-
-    Uses sec_daily_index_checkpoint to determine which dates still need loading.
-    Stops on the first fetch failure and updates checkpoint status accordingly.
-    Returns (write_records, []) - no silver staging from daily index fetches alone.
-    """
-    db = _open_silver_database(context.silver_root)
+    now: datetime,
+    force: bool,
+) -> dict[str, Any]:
+    """Fetch missing daily indexes in ascending order up to end_date."""
     last_success = db.get_last_successful_checkpoint_date()
 
     if last_success is not None:
-        start_date = date.fromisoformat(last_success) + timedelta(days=1)
+        start_date = _next_business_day(date.fromisoformat(last_success))
     else:
-        start_date = end_date  # No history; only fetch the end date
+        start_date = end_date
 
     raw_writes: list[dict[str, Any]] = []
-    now = datetime.now(UTC)
+    rows_written = 0
+    rows_skipped = 0
+    status = "succeeded"
 
     for target_date in _date_range(start_date, end_date):
-        if not _is_business_day(target_date):
-            continue
-        existing = db.get_daily_index_checkpoint(target_date.isoformat())
-        if existing and existing.get("status") == "succeeded":
-            continue
+        result = _load_daily_index_for_date(
+            context=context,
+            db=db,
+            target_date=target_date,
+            sync_run_id=sync_run_id,
+            now=now,
+            force=force,
+        )
+        raw_writes.extend(result["raw_writes"])
+        rows_written += result["rows_written"]
+        rows_skipped += result["rows_skipped"]
+        if result["status"] in {"waiting_for_publish", "failed_retryable"}:
+            status = "partial"
+            break
 
-        source_url = _build_daily_index_url(target_date)
-        expected_available_at = _expected_available_at(target_date)
-
-        try:
-            write_record, _ = _capture_daily_index_file(context=context, target_date=target_date)
-            raw_writes.append(write_record)
-            db.upsert_daily_index_checkpoint({
-                "business_date": target_date.isoformat(),
-                "source_key": f"date:{target_date.isoformat()}",
-                "source_url": source_url,
-                "expected_available_at": expected_available_at,
-                "last_attempt_at": now,
-                "raw_object_id": write_record["sha256"],
-                "last_sha256": write_record["sha256"],
-                "row_count": None,
-                "status": "succeeded",
-                "last_success_at": now,
-            })
-        except WarehouseRuntimeError as exc:
-            db.upsert_daily_index_checkpoint({
-                "business_date": target_date.isoformat(),
-                "source_key": f"date:{target_date.isoformat()}",
-                "source_url": source_url,
-                "expected_available_at": expected_available_at,
-                "last_attempt_at": now,
-                "status": "failed_retryable",
-                "error_message": str(exc),
-            })
-            break  # Stop on first failure per spec
-
-    return raw_writes, []
+    return {
+        "raw_writes": raw_writes,
+        "rows_written": rows_written,
+        "rows_skipped": rows_skipped,
+        "status": status,
+    }
 
 
 def _is_business_day(d: date) -> bool:
-    """Return True if d is Monday-Friday (US federal holidays not yet filtered)."""
-    return d.weekday() < 5  # 0=Monday, 4=Friday
+    """Return True for expected SEC business dates."""
+    return d.weekday() < 5 and d not in _us_federal_holidays(d.year)
 
 
 def _expected_available_at(business_date: date) -> datetime:
-    """Return the expected availability timestamp: 06:00 America/New_York on next calendar day.
-
-    Stored as UTC (06:00 EST = 11:00 UTC, 06:00 EDT = 10:00 UTC).
-    Using a conservative 11:00 UTC (EST) approximation.
-    """
     next_day = business_date + timedelta(days=1)
-    return datetime(next_day.year, next_day.month, next_day.day, 11, 0, 0, tzinfo=UTC)
+    local = datetime(next_day.year, next_day.month, next_day.day, 6, 0, 0, tzinfo=_ET_ZONE)
+    return local.astimezone(UTC)
 
 
 def _write_bronze_object(
@@ -889,9 +1563,7 @@ def _sec_archive_url() -> str:
 
 def _require_cik_list(raw_ciks: Any, command_name: str) -> list[int]:
     if not raw_ciks:
-        raise WarehouseRuntimeError(
-            f"{command_name} in bronze_capture mode requires --cik-list until sec_tracked_universe is implemented"
-        )
+        raise WarehouseRuntimeError(f"{command_name} requires --cik-list or a seeded tracked universe")
     return [_parse_cik(value) for value in raw_ciks]
 
 
@@ -900,6 +1572,33 @@ def _parse_cik(value: Any) -> int:
         return int(str(value).strip())
     except ValueError as exc:
         raise WarehouseRuntimeError(f"Invalid CIK value: {value}") from exc
+
+
+def _resolve_target_ciks(
+    *,
+    db: SilverDatabase,
+    raw_ciks: Any,
+    command_name: str,
+    tracking_status_filter: str,
+) -> list[int]:
+    if raw_ciks:
+        return [_parse_cik(value) for value in raw_ciks]
+    ciks = db.get_tracked_universe_ciks(status_filter=tracking_status_filter)
+    if ciks:
+        return ciks
+    raise WarehouseRuntimeError(f"{command_name} requires --cik-list or a seeded tracked universe")
+
+
+def _resolve_reconcile_ciks(
+    *,
+    db: SilverDatabase,
+    raw_ciks: Any,
+    sample_limit: int | None,
+) -> list[int]:
+    ciks = [_parse_cik(value) for value in raw_ciks] if raw_ciks else db.get_tracked_universe_ciks(status_filter="active")
+    if sample_limit is not None:
+        return ciks[: int(sample_limit)]
+    return ciks
 
 
 def _decode_json_bytes(payload: bytes, source_url: str) -> dict[str, Any]:
@@ -983,6 +1682,114 @@ def _dedupe_ints(values: list[int]) -> list[int]:
     return deduped
 
 
+def _dedupe_strings(values: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = str(value).strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return deduped
+
+
+def _latest_filing_date(rows: list[dict[str, Any]]) -> date | None:
+    values = [row.get("filing_date") for row in rows if row.get("filing_date") is not None]
+    if not values:
+        return None
+    normalized = [value if isinstance(value, date) else date.fromisoformat(str(value)) for value in values]
+    return max(normalized)
+
+
+def _latest_acceptance_datetime(rows: list[dict[str, Any]]) -> datetime | None:
+    values = [_parse_acceptance_datetime(row.get("acceptance_datetime")) for row in rows]
+    filtered = [value for value in values if value is not None]
+    return max(filtered) if filtered else None
+
+
+def _parse_acceptance_datetime(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    for fmt in ("%Y%m%d%H%M%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            parsed = datetime.strptime(text[: len(fmt.replace("%", ""))], fmt)
+            return parsed.replace(tzinfo=UTC)
+        except ValueError:
+            continue
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+    except ValueError:
+        return None
+
+
+def _next_business_day(value: date) -> date:
+    candidate = value + timedelta(days=1)
+    while not _is_business_day(candidate):
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def _previous_business_day(today: date) -> date:
+    candidate = today - timedelta(days=1)
+    while not _is_business_day(candidate):
+        candidate -= timedelta(days=1)
+    return candidate
+
+
+def _latest_eligible_business_date(now: datetime) -> date:
+    candidate = _previous_business_day(now.astimezone(_ET_ZONE).date() + timedelta(days=1))
+    while candidate and _expected_available_at(candidate) > now:
+        candidate = _previous_business_day(candidate)
+    return candidate
+
+
+def _us_federal_holidays(year: int) -> set[date]:
+    return {
+        _observed_date(date(year, 1, 1)),
+        _nth_weekday(year, 1, 0, 3),   # Martin Luther King Jr. Day
+        _nth_weekday(year, 2, 0, 3),   # Washington's Birthday
+        _last_weekday(year, 5, 0),     # Memorial Day
+        _observed_date(date(year, 6, 19)),
+        _observed_date(date(year, 7, 4)),
+        _nth_weekday(year, 9, 0, 1),   # Labor Day
+        _nth_weekday(year, 10, 0, 2),  # Columbus Day
+        _observed_date(date(year, 11, 11)),
+        _nth_weekday(year, 11, 3, 4),  # Thanksgiving
+        _observed_date(date(year, 12, 25)),
+    }
+
+
+def _observed_date(day: date) -> date:
+    if day.weekday() == 5:
+        return day - timedelta(days=1)
+    if day.weekday() == 6:
+        return day + timedelta(days=1)
+    return day
+
+
+def _nth_weekday(year: int, month: int, weekday: int, ordinal: int) -> date:
+    current = date(year, month, 1)
+    while current.weekday() != weekday:
+        current += timedelta(days=1)
+    current += timedelta(days=7 * (ordinal - 1))
+    return current
+
+
+def _last_weekday(year: int, month: int, weekday: int) -> date:
+    if month == 12:
+        current = date(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        current = date(year, month + 1, 1) - timedelta(days=1)
+    while current.weekday() != weekday:
+        current -= timedelta(days=1)
+    return current
+
+
 def _date_range(start: date, end: date) -> list[date]:
     days: list[date] = []
     current = start
@@ -992,59 +1799,58 @@ def _date_range(start: date, end: date) -> list[date]:
     return days
 
 
-def _execute_snowflake_sync(
-    context: SnowflakeSyncContext,
+def _sync_mode_for_command(command_name: str) -> str:
+    if command_name in {"bootstrap-full", "bootstrap-recent-10"}:
+        return "bootstrap"
+    if command_name in {"daily-incremental", "load-daily-form-index-for-date", "catch-up-daily-form-index"}:
+        return "incremental"
+    if command_name == "targeted-resync":
+        return "resync"
+    if command_name == "full-reconcile":
+        return "reconcile"
+    return "incremental"
+
+
+def _sync_scope_type_for_command(command_name: str, scope: dict[str, Any]) -> str:
+    if command_name in {"daily-incremental", "load-daily-form-index-for-date", "catch-up-daily-form-index"}:
+        return "daily_index"
+    if command_name in {"bootstrap-full", "bootstrap-recent-10"}:
+        return "submissions"
+    if command_name == "targeted-resync":
+        scope_type = str(scope.get("scope_type", "")).strip()
+        if scope_type == "cik":
+            return "submissions"
+        if scope_type == "accession":
+            return "artifact_fetch"
+        return "reference"
+    if command_name == "full-reconcile":
+        return "reconcile"
+    return "submissions"
+
+
+def _sync_scope_key_for_command(command_name: str, scope: dict[str, Any]) -> str | None:
+    if command_name == "daily-incremental":
+        return f"{scope['business_date_start']}:{scope['business_date_end']}"
+    if command_name == "load-daily-form-index-for-date":
+        return str(scope["target_date"])
+    if command_name == "catch-up-daily-form-index":
+        return str(scope["end_date"])
+    if command_name == "targeted-resync":
+        return str(scope.get("scope_key") or "")
+    if command_name == "full-reconcile":
+        cik_list = scope.get("cik_list") or []
+        return ",".join(str(value) for value in cik_list) or None
+    cik_list = scope.get("cik_list") or []
+    return ",".join(str(value) for value in cik_list) or None
+
+
+def _resolve_scope(
     command_name: str,
     arguments: dict[str, Any],
+    now: datetime,
+    silver_root: StorageLocation | None = None,
 ) -> dict[str, Any]:
-    workflow_name = str(arguments.get("workflow_name", "")).strip()
-    if not workflow_name:
-        raise WarehouseRuntimeError("workflow_name is required for snowflake-sync-after-load")
-
-    run_id = _resolve_run_id(arguments)
-    now = datetime.now(UTC)
-
-    return {
-        "arguments": arguments,
-        "command": command_name,
-        "environment": {
-            "snowflake_export_root": context.export_root.root,
-            "snowflake_runtime_metadata_present": True,
-            "wif_only": True,
-        },
-        "message": (
-            "Snowflake sync infrastructure validation completed successfully. "
-            "The runtime metadata passed validation and the source-load plus refresh wrapper calls "
-            "were derived."
-        ),
-        "source_load_call": (
-            f"CALL {context.metadata['source_load_procedure']}('{workflow_name}', '{run_id}')"
-        ),
-        "refresh_call": (
-            f"CALL {context.metadata['refresh_procedure']}('{workflow_name}', '{run_id}')"
-        ),
-        "run_id": run_id,
-        "runtime_mode": "infrastructure_validation",
-        "snowflake": {
-            "account": context.metadata["account"],
-            "database": context.metadata["database"],
-            "source_schema": context.metadata["source_schema"],
-            "gold_schema": context.metadata["gold_schema"],
-            "refresh_warehouse": context.metadata["refresh_warehouse"],
-            "runtime_role": context.metadata["runtime_role"],
-            "stage_name": context.metadata["stage_name"],
-            "file_format_name": context.metadata["file_format_name"],
-            "status_table_name": context.metadata["status_table_name"],
-            "source_load_procedure": context.metadata["source_load_procedure"],
-            "storage_integration": context.metadata["storage_integration"],
-        },
-        "started_at": now.isoformat().replace("+00:00", "Z"),
-        "status": "ok",
-        "workflow_name": workflow_name,
-    }
-
-
-def _resolve_scope(command_name: str, arguments: dict[str, Any], now: datetime) -> dict[str, Any]:
+    db = _open_silver_database(silver_root) if silver_root is not None else None
     if command_name == "bootstrap-recent-10":
         return {
             "cik_list": arguments.get("cik_list"),
@@ -1061,13 +1867,14 @@ def _resolve_scope(command_name: str, arguments: dict[str, Any], now: datetime) 
     if command_name == "daily-incremental":
         start_date = _parse_date(arguments.get("start_date"), "start_date")
         end_date = _parse_date(arguments.get("end_date"), "end_date")
-        if start_date is None and end_date is None:
-            start_date = _previous_business_day(now.date())
-            end_date = start_date
-        elif start_date is None:
-            start_date = end_date
-        elif end_date is None:
-            end_date = start_date
+        if end_date is None:
+            end_date = _latest_eligible_business_date(now)
+        if start_date is None:
+            last_success = db.get_last_successful_checkpoint_date() if db is not None else None
+            if last_success:
+                start_date = _next_business_day(date.fromisoformat(last_success))
+            else:
+                start_date = end_date
         if start_date is None or end_date is None:
             raise WarehouseRuntimeError("daily_incremental could not resolve a business date range")
         if start_date > end_date:
@@ -1087,7 +1894,7 @@ def _resolve_scope(command_name: str, arguments: dict[str, Any], now: datetime) 
     if command_name == "catch-up-daily-form-index":
         end_date = _parse_date(arguments.get("end_date"), "end_date")
         if end_date is None:
-            end_date = _previous_business_day(now.date())
+            end_date = _latest_eligible_business_date(now)
         return {"end_date": end_date.isoformat()}
 
     if command_name == "targeted-resync":
@@ -1178,21 +1985,76 @@ def _snowflake_export_manifest(
     arguments: dict[str, Any],
     now: datetime,
     runtime_mode: str,
+    row_count: int = 0,
+    file_count: int = 0,
 ) -> dict[str, Any]:
     return {
         "business_date": business_date,
         "command": command_name,
         "compression": "snappy",
         "exported_at": now.isoformat().replace("+00:00", "Z"),
-        "file_count": 0,
+        "file_count": file_count,
         "format": "parquet",
-        "row_count": 0,
+        "row_count": row_count,
         "run_id": run_id,
         "runtime_mode": runtime_mode,
         "schema_version": 1,
         "table_name": table_name,
         "workflow_name": command_name.replace("-", "_"),
         "workflow_arguments": arguments,
+    }
+
+
+def _snowflake_export_run_manifest_relative_path(workflow_name: str, business_date: str, run_id: str) -> str:
+    return (
+        f"manifests/workflow_name={workflow_name}/business_date={business_date}/run_id={run_id}/run_manifest.json"
+    )
+
+
+def _snowflake_export_run_manifest(
+    *,
+    environment_name: str,
+    command_name: str,
+    run_id: str,
+    business_date: str,
+    now: datetime,
+    export_counts: dict[str, int],
+) -> dict[str, Any]:
+    tables = [
+        _snowflake_export_run_manifest_table(
+            table_name=table_name,
+            table_path=table_path,
+            run_id=run_id,
+            business_date=business_date,
+            row_count=export_counts.get(table_path, 0),
+        )
+        for table_name, table_path in SNOWFLAKE_EXPORT_TABLES.items()
+    ]
+    return {
+        "business_date": business_date,
+        "completed_at": now.isoformat().replace("+00:00", "Z"),
+        "environment": environment_name,
+        "run_id": run_id,
+        "schema_version": 1,
+        "tables": tables,
+        "workflow_name": command_name.replace("-", "_"),
+    }
+
+
+def _snowflake_export_run_manifest_table(
+    *,
+    table_name: str,
+    table_path: str,
+    run_id: str,
+    business_date: str,
+    row_count: int,
+) -> dict[str, Any]:
+    relative_path = f"{table_path}/business_date={business_date}/run_id={run_id}/{table_path}.parquet"
+    return {
+        "file_count": 1,
+        "relative_path": relative_path,
+        "row_count": row_count,
+        "table_name": table_name,
     }
 
 
@@ -1217,13 +2079,6 @@ def _parse_date(value: Any, field_name: str) -> date | None:
         return date.fromisoformat(value)
     except ValueError as exc:
         raise WarehouseRuntimeError(f"{field_name} must be a date string in YYYY-MM-DD format") from exc
-
-
-def _previous_business_day(today: date) -> date:
-    candidate = today - timedelta(days=1)
-    while candidate.weekday() >= 5:
-        candidate -= timedelta(days=1)
-    return candidate
 
 
 def _namespace_to_payload(args: Any) -> dict[str, Any]:

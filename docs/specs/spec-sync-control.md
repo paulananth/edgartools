@@ -245,3 +245,13 @@ Key test cases:
 - `test_full_reconcile_auto_heal`: run with `auto_heal=True`; assert findings transition to `resolved`.
 - `test_bootstrap_sets_completed_at`: after bootstrap workflow, CIK has `bootstrap_completed_at` non-null.
 - `test_pagination_completion_flag`: after pagination backfill, `pagination_completed_at` set when counts match.
+
+Workflow-level verification must emit result summaries for:
+
+- `sec_sync_run`
+- `sec_source_checkpoint`
+- `sec_company_sync_state`
+- `sec_reconcile_finding`
+
+Each summary must include `table`, ordered `columns`, and `row_count` using the shared
+warehouse verification helper.

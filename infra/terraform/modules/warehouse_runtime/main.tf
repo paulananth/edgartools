@@ -1,20 +1,10 @@
 data "aws_caller_identity" "current" {}
 
 locals {
-  name_prefix                = "edgartools-${var.environment}"
-  container_name             = "edgar-warehouse"
-  database_name              = "EDGARTOOLS_${upper(var.environment)}"
-  source_schema_name         = "EDGARTOOLS_SOURCE"
-  gold_schema_name           = "EDGARTOOLS_GOLD"
-  refresh_warehouse_name     = "EDGARTOOLS_${upper(var.environment)}_REFRESH_WH"
-  runtime_role_name          = "EDGARTOOLS_${upper(var.environment)}_REFRESHER"
-  refresher_user_name        = "EDGARTOOLS_${upper(var.environment)}_REFRESHER_USER"
-  stage_name                 = "EDGARTOOLS_SOURCE_EXPORT_STAGE"
-  file_format_name           = "EDGARTOOLS_SOURCE_EXPORT_FILE_FORMAT"
-  status_table_name          = "SNOWFLAKE_REFRESH_STATUS"
-  source_load_procedure_name = "EDGARTOOLS_SOURCE.LOAD_EXPORTS_FOR_RUN"
-  refresh_procedure_name     = "EDGARTOOLS_GOLD.REFRESH_AFTER_LOAD"
-  snowflake_export_root      = "s3://${var.snowflake_export_bucket_name}/warehouse/artifacts/snowflake_exports"
+  name_prefix               = "edgartools-${var.environment}"
+  container_name            = "edgar-warehouse"
+  snowflake_export_root     = "s3://${var.snowflake_export_bucket_name}/warehouse/artifacts/snowflake_exports"
+  snowflake_manifest_prefix = "warehouse/artifacts/snowflake_exports/manifests/"
   tags = merge(
     {
       Environment = var.environment
@@ -52,60 +42,52 @@ locals {
   }
 
   task_profile_by_workflow = merge(local.default_task_profile_by_workflow, var.task_profile_by_workflow)
-  snowflake_task_profile   = local.task_profiles[var.snowflake_task_profile_name]
 
   workflows = {
     daily_incremental = {
-      task_profile                 = local.task_profile_by_workflow.daily_incremental
-      schedule_expression          = var.daily_incremental_schedule
-      gold_affecting               = true
+      task_profile        = local.task_profile_by_workflow.daily_incremental
+      schedule_expression = var.daily_incremental_schedule
+      gold_affecting      = true
       # $.cik_list required until sec_tracked_universe seeding is implemented (Phase A step 1)
       warehouse_command_expression = "States.Array('daily-incremental', '--run-id', $$.Execution.Name, '--cik-list', $.cik_list)"
-      snowflake_command_expression = "States.Array('snowflake-sync-after-load', '--workflow-name', 'daily_incremental', '--run-id', $$.Execution.Name)"
     }
     bootstrap_recent_10 = {
-      task_profile                 = local.task_profile_by_workflow.bootstrap_recent_10
-      schedule_expression          = null
-      gold_affecting               = true
+      task_profile        = local.task_profile_by_workflow.bootstrap_recent_10
+      schedule_expression = null
+      gold_affecting      = true
       # $.cik_list required until sec_tracked_universe seeding is implemented (Phase A step 1)
       warehouse_command_expression = "States.Array('bootstrap-recent-10', '--run-id', $$.Execution.Name, '--cik-list', $.cik_list)"
-      snowflake_command_expression = "States.Array('snowflake-sync-after-load', '--workflow-name', 'bootstrap_recent_10', '--run-id', $$.Execution.Name)"
     }
     bootstrap_full = {
-      task_profile                 = local.task_profile_by_workflow.bootstrap_full
-      schedule_expression          = null
-      gold_affecting               = true
+      task_profile        = local.task_profile_by_workflow.bootstrap_full
+      schedule_expression = null
+      gold_affecting      = true
       # $.cik_list required until sec_tracked_universe seeding is implemented (Phase A step 1)
       warehouse_command_expression = "States.Array('bootstrap-full', '--run-id', $$.Execution.Name, '--cik-list', $.cik_list)"
-      snowflake_command_expression = "States.Array('snowflake-sync-after-load', '--workflow-name', 'bootstrap_full', '--run-id', $$.Execution.Name)"
     }
     targeted_resync = {
       task_profile                 = local.task_profile_by_workflow.targeted_resync
       schedule_expression          = null
       gold_affecting               = true
       warehouse_command_expression = "States.Array('targeted-resync', '--scope-type', $.scope_type, '--scope-key', $.scope_key, '--run-id', $$.Execution.Name)"
-      snowflake_command_expression = "States.Array('snowflake-sync-after-load', '--workflow-name', 'targeted_resync', '--run-id', $$.Execution.Name)"
     }
     full_reconcile = {
       task_profile                 = local.task_profile_by_workflow.full_reconcile
       schedule_expression          = var.full_reconcile_schedule
       gold_affecting               = true
       warehouse_command_expression = "States.Array('full-reconcile', '--run-id', $$.Execution.Name)"
-      snowflake_command_expression = "States.Array('snowflake-sync-after-load', '--workflow-name', 'full_reconcile', '--run-id', $$.Execution.Name)"
     }
     load_daily_form_index_for_date = {
       task_profile                 = local.task_profile_by_workflow.load_daily_form_index_for_date
       schedule_expression          = null
       gold_affecting               = false
       warehouse_command_expression = "States.Array('load-daily-form-index-for-date', $.target_date, '--run-id', $$.Execution.Name)"
-      snowflake_command_expression = null
     }
     catch_up_daily_form_index = {
       task_profile                 = local.task_profile_by_workflow.catch_up_daily_form_index
       schedule_expression          = null
       gold_affecting               = false
       warehouse_command_expression = "States.Array('catch-up-daily-form-index', '--run-id', $$.Execution.Name)"
-      snowflake_command_expression = null
     }
   }
 
@@ -117,6 +99,7 @@ locals {
 
 resource "aws_ecr_repository" "warehouse" {
   name                 = "${local.name_prefix}-warehouse"
+  force_delete         = var.ecr_force_delete
   image_tag_mutability = "IMMUTABLE"
 
   image_scanning_configuration {
@@ -140,6 +123,64 @@ resource "aws_cloudwatch_log_group" "step_functions" {
   tags = local.tags
 }
 
+resource "aws_sns_topic" "snowflake_manifest_events" {
+  name = "${local.name_prefix}-snowflake-manifest-events"
+  tags = merge(local.tags, { Name = "${local.name_prefix}-snowflake-manifest-events" })
+}
+
+resource "aws_sns_topic_policy" "snowflake_manifest_events" {
+  arn = aws_sns_topic.snowflake_manifest_events.arn
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = concat(
+      [
+        {
+          Sid    = "AllowS3PublishFromSnowflakeExportBucket"
+          Effect = "Allow"
+          Principal = {
+            Service = "s3.amazonaws.com"
+          }
+          Action   = "SNS:Publish"
+          Resource = aws_sns_topic.snowflake_manifest_events.arn
+          Condition = {
+            ArnLike = {
+              "aws:SourceArn" = var.snowflake_export_bucket_arn
+            }
+            StringEquals = {
+              "aws:SourceAccount" = data.aws_caller_identity.current.account_id
+            }
+          }
+        }
+      ],
+      var.snowflake_manifest_subscriber_arn == null ? [] : [
+        {
+          Sid    = "AllowSnowflakeSubscribeToManifestTopic"
+          Effect = "Allow"
+          Principal = {
+            AWS = var.snowflake_manifest_subscriber_arn
+          }
+          Action   = "SNS:Subscribe"
+          Resource = aws_sns_topic.snowflake_manifest_events.arn
+        }
+      ]
+    )
+  })
+}
+
+resource "aws_s3_bucket_notification" "snowflake_manifest_events" {
+  bucket = var.snowflake_export_bucket_name
+
+  topic {
+    topic_arn     = aws_sns_topic.snowflake_manifest_events.arn
+    events        = ["s3:ObjectCreated:*"]
+    filter_prefix = local.snowflake_manifest_prefix
+    filter_suffix = ".json"
+  }
+
+  depends_on = [aws_sns_topic_policy.snowflake_manifest_events]
+}
+
 resource "aws_secretsmanager_secret" "edgar_identity" {
   count = var.edgar_identity_secret_arn == null ? 1 : 0
 
@@ -157,80 +198,10 @@ resource "aws_secretsmanager_secret_version" "edgar_identity" {
   secret_string = var.edgar_identity_value
 }
 
-resource "aws_secretsmanager_secret" "snowflake_runtime" {
-  count = var.snowflake_runtime_secret_arn == null ? 1 : 0
-
-  name                    = "${local.name_prefix}-snowflake-runtime"
-  description             = "WIF-only Snowflake runtime metadata for ${var.environment}."
-  recovery_window_in_days = 0
-  kms_key_id              = var.snowflake_export_kms_key_arn
-
-  tags = merge(local.tags, { Name = "${local.name_prefix}-snowflake-runtime" })
-}
-
-resource "aws_secretsmanager_secret" "snowflake_private_key" {
-  count = var.snowflake_private_key_secret_arn == null ? 1 : 0
-
-  name                    = "${local.name_prefix}-snowflake-private-key"
-  description             = "RSA private key for Snowflake key-pair authentication (WIF model) in ${var.environment}."
-  recovery_window_in_days = 0
-  kms_key_id              = var.snowflake_export_kms_key_arn
-
-  tags = merge(local.tags, { Name = "${local.name_prefix}-snowflake-private-key" })
-}
-
-resource "aws_secretsmanager_secret_version" "snowflake_private_key" {
-  count = var.snowflake_private_key_secret_arn == null && var.snowflake_private_key_pem != null ? 1 : 0
-
-  secret_id     = aws_secretsmanager_secret.snowflake_private_key[0].id
-  secret_string = var.snowflake_private_key_pem
-}
-
-resource "aws_secretsmanager_secret_version" "snowflake_runtime" {
-  count = var.snowflake_runtime_secret_arn == null ? 1 : 0
-
-  secret_id = aws_secretsmanager_secret.snowflake_runtime[0].id
-  secret_string = jsonencode({
-    account               = var.snowflake_account_identifier
-    database              = local.database_name
-    source_schema         = local.source_schema_name
-    gold_schema           = local.gold_schema_name
-    refresh_warehouse     = local.refresh_warehouse_name
-    runtime_role          = local.runtime_role_name
-    refresher_user        = local.refresher_user_name
-    storage_integration   = var.snowflake_storage_integration_name
-    stage_name            = local.stage_name
-    file_format_name      = local.file_format_name
-    status_table_name     = local.status_table_name
-    source_load_procedure = local.source_load_procedure_name
-    refresh_procedure     = local.refresh_procedure_name
-  })
-
-  lifecycle {
-    precondition {
-      condition = (
-        var.snowflake_account_identifier != null &&
-        trimspace(var.snowflake_account_identifier) != "" &&
-        var.snowflake_storage_integration_name != null &&
-        trimspace(var.snowflake_storage_integration_name) != ""
-      )
-      error_message = "snowflake_account_identifier and snowflake_storage_integration_name are required when snowflake_runtime_secret_arn is not provided."
-    }
-  }
-}
-
 locals {
   resolved_edgar_identity_secret_arn = coalesce(
     var.edgar_identity_secret_arn,
     try(aws_secretsmanager_secret.edgar_identity[0].arn, null),
-  )
-  resolved_snowflake_runtime_secret_arn = coalesce(
-    var.snowflake_runtime_secret_arn,
-    try(aws_secretsmanager_secret.snowflake_runtime[0].arn, null),
-  )
-  resolved_snowflake_private_key_secret_arn = coalesce(
-    var.snowflake_private_key_secret_arn,
-    try(aws_secretsmanager_secret.snowflake_private_key[0].arn, null),
   )
 }
 
@@ -283,59 +254,6 @@ resource "aws_iam_role_policy" "ecs_task_execution_warehouse_secret" {
         ]
         Resource = local.resolved_edgar_identity_secret_arn
       }
-    ]
-  })
-}
-
-resource "aws_iam_role" "ecs_task_execution_snowflake" {
-  name = "${local.name_prefix}-snowflake-execution"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Principal = {
-          Service = "ecs-tasks.amazonaws.com"
-        }
-        Action = "sts:AssumeRole"
-      }
-    ]
-  })
-
-  tags = local.tags
-}
-
-resource "aws_iam_role_policy_attachment" "ecs_task_execution_snowflake_managed" {
-  role       = aws_iam_role.ecs_task_execution_snowflake.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
-}
-
-resource "aws_iam_role_policy" "ecs_task_execution_snowflake_secret" {
-  name = "${local.name_prefix}-snowflake-execution-secret"
-  role = aws_iam_role.ecs_task_execution_snowflake.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "secretsmanager:GetSecretValue"
-        ]
-        Resource = [
-          local.resolved_snowflake_runtime_secret_arn,
-          local.resolved_snowflake_private_key_secret_arn,
-        ]
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "kms:Decrypt",
-          "kms:DescribeKey"
-        ]
-        Resource = var.snowflake_export_kms_key_arn
-      },
     ]
   })
 }
@@ -430,66 +348,6 @@ resource "aws_iam_role_policy" "ecs_task_warehouse_storage" {
   })
 }
 
-resource "aws_iam_role" "ecs_task_snowflake" {
-  name = "${local.name_prefix}-snowflake-task"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Principal = {
-          Service = "ecs-tasks.amazonaws.com"
-        }
-        Action = "sts:AssumeRole"
-      }
-    ]
-  })
-
-  tags = local.tags
-}
-
-resource "aws_iam_role_policy" "ecs_task_snowflake_storage" {
-  name = "${local.name_prefix}-snowflake-storage"
-  role = aws_iam_role.ecs_task_snowflake.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "s3:ListBucket"
-        ]
-        Resource = var.snowflake_export_bucket_arn
-        Condition = {
-          StringLike = {
-            "s3:prefix" = [
-              "warehouse/artifacts/snowflake_exports",
-              "warehouse/artifacts/snowflake_exports/*"
-            ]
-          }
-        }
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "s3:GetObject"
-        ]
-        Resource = "${var.snowflake_export_bucket_arn}/warehouse/artifacts/snowflake_exports/*"
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "kms:Decrypt",
-          "kms:DescribeKey"
-        ]
-        Resource = var.snowflake_export_kms_key_arn
-      }
-    ]
-  })
-}
-
 resource "aws_ecs_task_definition" "warehouse" {
   for_each = local.task_profiles
 
@@ -524,6 +382,10 @@ resource "aws_ecs_task_definition" "warehouse" {
           {
             name  = "WAREHOUSE_RUNTIME_MODE"
             value = var.warehouse_runtime_mode
+          },
+          {
+            name  = "WAREHOUSE_ENVIRONMENT"
+            value = var.environment
           },
           {
             name  = "SNOWFLAKE_EXPORT_ROOT"
@@ -565,55 +427,6 @@ resource "aws_ecs_task_definition" "warehouse" {
   tags = merge(local.tags, { TaskProfile = each.key, Runtime = "warehouse" })
 }
 
-resource "aws_ecs_task_definition" "snowflake" {
-  family                   = "${local.name_prefix}-snowflake-sync"
-  cpu                      = tostring(local.snowflake_task_profile.cpu)
-  memory                   = tostring(local.snowflake_task_profile.memory)
-  network_mode             = "awsvpc"
-  requires_compatibilities = ["FARGATE"]
-  execution_role_arn       = aws_iam_role.ecs_task_execution_snowflake.arn
-  task_role_arn            = aws_iam_role.ecs_task_snowflake.arn
-
-  container_definitions = jsonencode([
-    {
-      name      = local.container_name
-      image     = coalesce(var.container_image, "scratch")
-      essential = true
-      command   = ["snowflake-sync-after-load", "--help"]
-      environment = [
-        {
-          name  = "AWS_REGION"
-          value = var.aws_region
-        },
-        {
-          name  = "SNOWFLAKE_EXPORT_ROOT"
-          value = local.snowflake_export_root
-        }
-      ]
-      secrets = [
-        {
-          name      = "SNOWFLAKE_RUNTIME_METADATA"
-          valueFrom = local.resolved_snowflake_runtime_secret_arn
-        },
-        {
-          name      = "SNOWFLAKE_PRIVATE_KEY"
-          valueFrom = local.resolved_snowflake_private_key_secret_arn
-        }
-      ]
-      logConfiguration = {
-        logDriver = "awslogs"
-        options = {
-          awslogs-group         = aws_cloudwatch_log_group.ecs.name
-          awslogs-region        = var.aws_region
-          awslogs-stream-prefix = "snowflake-sync"
-        }
-      }
-    }
-  ])
-
-  tags = merge(local.tags, { TaskProfile = var.snowflake_task_profile_name, Runtime = "snowflake-sync" })
-}
-
 resource "aws_iam_role" "step_functions" {
   name = "${local.name_prefix}-step-functions"
 
@@ -645,10 +458,7 @@ resource "aws_iam_role_policy" "step_functions_runtime" {
         Action = [
           "ecs:RunTask"
         ]
-        Resource = concat(
-          [for task_definition in aws_ecs_task_definition.warehouse : task_definition.arn],
-          [aws_ecs_task_definition.snowflake.arn],
-        )
+        Resource = [for task_definition in aws_ecs_task_definition.warehouse : task_definition.arn]
       },
       {
         Effect = "Allow"
@@ -665,9 +475,7 @@ resource "aws_iam_role_policy" "step_functions_runtime" {
         ]
         Resource = [
           aws_iam_role.ecs_task_execution_warehouse.arn,
-          aws_iam_role.ecs_task_warehouse.arn,
-          aws_iam_role.ecs_task_execution_snowflake.arn,
-          aws_iam_role.ecs_task_snowflake.arn
+          aws_iam_role.ecs_task_warehouse.arn
         ]
       },
       {
@@ -703,18 +511,7 @@ resource "aws_sfn_state_machine" "workflow" {
   name     = "${local.name_prefix}-${replace(each.key, "_", "-")}"
   role_arn = aws_iam_role.step_functions.arn
 
-  definition = each.value.gold_affecting ? templatefile("${path.module}/templates/ecs_run_task_with_snowflake.asl.json.tmpl", {
-    cluster_arn                   = aws_ecs_cluster.warehouse.arn
-    warehouse_task_definition_arn = aws_ecs_task_definition.warehouse[each.value.task_profile].arn
-    snowflake_task_definition_arn = aws_ecs_task_definition.snowflake.arn
-    container_name                = local.container_name
-    warehouse_command_expression  = each.value.warehouse_command_expression
-    snowflake_command_expression  = each.value.snowflake_command_expression
-    public_subnets_json           = jsonencode(var.public_subnet_ids)
-    private_subnets_json          = jsonencode(var.private_subnet_ids)
-    public_security_groups_json   = jsonencode([var.public_security_group_id])
-    private_security_groups_json  = jsonencode([var.private_security_group_id])
-    }) : templatefile("${path.module}/templates/ecs_run_task_single_step.asl.json.tmpl", {
+  definition = templatefile("${path.module}/templates/ecs_run_task_single_step.asl.json.tmpl", {
     cluster_arn                  = aws_ecs_cluster.warehouse.arn
     task_definition_arn          = aws_ecs_task_definition.warehouse[each.value.task_profile].arn
     container_name               = local.container_name
@@ -790,8 +587,9 @@ resource "aws_secretsmanager_secret" "runner_credentials" {
 }
 
 resource "aws_iam_user" "runner" {
-  name = "${local.name_prefix}-runner"
-  tags = merge(local.tags, { Name = "${local.name_prefix}-runner", Role = "runner" })
+  name          = "${local.name_prefix}-runner"
+  force_destroy = var.runner_user_force_destroy
+  tags          = merge(local.tags, { Name = "${local.name_prefix}-runner", Role = "runner" })
 }
 
 resource "aws_iam_user_policy" "runner" {
@@ -802,9 +600,9 @@ resource "aws_iam_user_policy" "runner" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "StartWorkflows"
-        Effect = "Allow"
-        Action = ["states:StartExecution"]
+        Sid      = "StartWorkflows"
+        Effect   = "Allow"
+        Action   = ["states:StartExecution"]
         Resource = [for workflow in aws_sfn_state_machine.workflow : workflow.arn]
       },
       {
@@ -874,29 +672,4 @@ resource "aws_cloudwatch_metric_alarm" "workflow_failures" {
   dimensions = {
     StateMachineArn = aws_sfn_state_machine.workflow[each.key].arn
   }
-}
-
-resource "aws_cloudwatch_log_metric_filter" "snowflake_sync_degraded" {
-  name           = "${local.name_prefix}-snowflake-sync-degraded"
-  log_group_name = aws_cloudwatch_log_group.step_functions.name
-  pattern        = "SNOWFLAKE_SYNC_DEGRADED"
-
-  metric_transformation {
-    name      = "SnowflakeSyncDegraded"
-    namespace = "EdgarTools/Warehouse"
-    value     = "1"
-  }
-}
-
-resource "aws_cloudwatch_metric_alarm" "snowflake_sync_degraded" {
-  alarm_name          = "${local.name_prefix}-snowflake-sync-degraded"
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  evaluation_periods  = 1
-  metric_name         = "SnowflakeSyncDegraded"
-  namespace           = "EdgarTools/Warehouse"
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 1
-  treat_missing_data  = "notBreaching"
-  alarm_description   = "Alarm when Snowflake sync degrades after the canonical warehouse run succeeds."
 }

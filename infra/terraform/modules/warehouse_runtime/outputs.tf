@@ -18,9 +18,9 @@ output "edgar_identity_secret_arn" {
   value       = local.resolved_edgar_identity_secret_arn
 }
 
-output "snowflake_runtime_secret_arn" {
-  description = "Snowflake runtime metadata secret ARN used by the private sync runner."
-  value       = local.resolved_snowflake_runtime_secret_arn
+output "snowflake_manifest_sns_topic_arn" {
+  description = "SNS topic ARN that receives Snowflake export run-manifest object notifications."
+  value       = aws_sns_topic.snowflake_manifest_events.arn
 }
 
 output "state_machine_arns" {
@@ -49,6 +49,6 @@ output "runner_user_arn" {
 }
 
 output "runner_credentials_secret_arn" {
-  description = "Secrets Manager ARN holding the runner access key credentials."
+  description = "Secrets Manager ARN holding the runner access key credentials. The secret value is populated out-of-band after aws iam create-access-key."
   value       = aws_secretsmanager_secret.runner_credentials.arn
 }

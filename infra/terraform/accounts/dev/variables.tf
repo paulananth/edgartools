@@ -54,19 +54,38 @@ variable "edgar_identity_value" {
 }
 
 variable "snowflake_runtime_secret_arn" {
-  description = "Optional pre-existing Snowflake runtime metadata secret ARN."
+  description = "Deprecated compatibility input for the retired AWS-managed Snowflake sync runner."
   type        = string
   default     = null
 }
 
 variable "snowflake_account_identifier" {
-  description = "Snowflake account identifier used by the runtime metadata secret."
+  description = "Deprecated compatibility input; Snowflake account bootstrap now happens outside the AWS runtime root."
   type        = string
   default     = null
 }
 
+variable "snowflake_private_key_secret_arn" {
+  description = "Deprecated compatibility input for the retired AWS-managed Snowflake sync runner."
+  type        = string
+  default     = null
+}
+
+variable "snowflake_private_key_pem" {
+  description = "Deprecated compatibility input for the retired AWS-managed Snowflake sync runner."
+  type        = string
+  sensitive   = true
+  default     = null
+}
+
 variable "snowflake_storage_integration_name" {
-  description = "Snowflake storage integration used for S3 export imports."
+  description = "Deprecated compatibility input; Snowflake import path bootstrap now lives in Snowflake tooling."
+  type        = string
+  default     = null
+}
+
+variable "snowflake_manifest_subscriber_arn" {
+  description = "Optional Snowflake-managed AWS principal ARN allowed to subscribe to the manifest SNS topic for Snowpipe auto-ingest."
   type        = string
   default     = null
 }
@@ -81,12 +100,6 @@ variable "public_subnet_cidrs" {
   description = "Public subnet CIDR blocks for dev."
   type        = list(string)
   default     = ["10.20.0.0/24", "10.20.1.0/24"]
-}
-
-variable "private_subnet_cidrs" {
-  description = "Private subnet CIDR blocks for the Snowflake sync runner in dev."
-  type        = list(string)
-  default     = ["10.20.10.0/24", "10.20.11.0/24"]
 }
 
 variable "availability_zones" {
@@ -129,7 +142,7 @@ variable "task_profile_by_workflow" {
 }
 
 variable "snowflake_task_profile_name" {
-  description = "Task profile name for the Snowflake sync runner."
+  description = "Deprecated compatibility input for the retired AWS-managed Snowflake sync runner."
   type        = string
   default     = "small"
 }

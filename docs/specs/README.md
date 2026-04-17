@@ -13,13 +13,13 @@ reading the full 1800-line master spec. All normative rules remain in `specifica
 | ID | File | Lines | Status | Depends On |
 |----|------|-------|--------|------------|
 | M0 | spec-contracts.md | 234 | Complete | None |
-| M1 | spec-infrastructure.md | 273 | Complete (verify-only) | M0 |
-| M2 | spec-silver-metadata.md | 300 | Complete (verify-only) | M0 |
-| M3 | spec-daily-index.md | 241 | Partial (bronze done, silver wiring pending) | M0, M2 |
-| M4 | spec-artifact-text-parser.md | 266 | Not started | M0, M2 |
-| M5 | spec-form-parsers.md | 260 | Not started (blocked on M4) | M0, M4 |
-| M6 | spec-gold-star-schema.md | 283 | In progress | M0, M2 |
-| M7 | spec-sync-control.md | 247 | Not started | M0, M2 |
+| M1 | spec-infrastructure.md | 273 | Complete (Snowflake-native pull architecture) | M0 |
+| M2 | spec-silver-metadata.md | 300 | Implemented (verification still expands) | M0 |
+| M3 | spec-daily-index.md | 241 | Implemented (E2E verification still expands) | M0, M2 |
+| M4 | spec-artifact-text-parser.md | 266 | Implemented (coverage still expands) | M0, M2 |
+| M5 | spec-form-parsers.md | 260 | Implemented (coverage still expands) | M0, M4 |
+| M6 | spec-gold-star-schema.md | 283 | Implemented (Snowflake source mirror and dbt verification still expand) | M0, M2 |
+| M7 | spec-sync-control.md | 247 | Implemented first slice (broader reconcile still expands) | M0, M2 |
 
 ## Dependency Graph
 
@@ -47,10 +47,10 @@ M0: spec-contracts.md  (no deps -- read first for every task)
 Wave 0  (prerequisite -- must be read before all other work)
   M0: spec-contracts.md
 
-Wave 1  (verify-only; both are already complete)
+Wave 1  (foundation)
   M1: Infrastructure          M2: Silver Metadata
 
-Wave 2  (max parallelism -- 4 independent tracks, all unblock after Wave 1)
+Wave 2  (parallel implementation and hardening)
   M3: Daily Index             M4: Artifact/Text Parser
   M6: Gold Star Schema        M7: Sync Control
 
@@ -58,8 +58,8 @@ Wave 3  (after M4 completes)
   M5: Form Parsers
 
 Wave 4  (integration smoke test)
-  End-to-end run through ingest -> silver -> gold
-  Minimum required: M2 + M3 + M6 complete
+  End-to-end run through ingest -> silver -> gold -> Snowflake source -> dbt gold
+  Minimum required: M2 + M3 + M6 complete plus Snowflake-native pull verification
 ```
 
 ## How To Use A Spec Module

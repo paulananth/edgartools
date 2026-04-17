@@ -5,6 +5,7 @@ Fast tests only - no network calls.
 import pytest
 from datetime import datetime, timezone
 from edgar_warehouse.silver import SilverDatabase
+from tests.warehouse_result_helpers import report_duckdb_table
 
 _NOW = datetime(2025, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
 _ACCESSION = "0000320193-24-000123"
@@ -153,3 +154,15 @@ def test_merge_filing_attachments_updates_raw_object_id(db):
 def test_get_filing_attachments_empty_for_unknown(db):
     results = db.get_filing_attachments("0000000000-00-000000")
     assert results == []
+
+
+@pytest.mark.fast
+def test_artifact_tables_report_table_summaries(db):
+    db.upsert_raw_object(_RAW_OBJ_ROW)
+    db.merge_filing_attachments(_ATTACHMENT_ROWS, sync_run_id="run-001")
+
+    raw_summary = report_duckdb_table(db._conn, "sec_raw_object")
+    attachment_summary = report_duckdb_table(db._conn, "sec_filing_attachment")
+
+    assert raw_summary["row_count"] == 1
+    assert attachment_summary["row_count"] == 2

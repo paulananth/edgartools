@@ -12,6 +12,8 @@ Implement a durable, analytics-friendly storage and processing system for SEC ED
 This specification extends the normalized model in [docs/sec-company-filings-data-model.md](C:/work/projects/edgartools/docs/sec-company-filings-data-model.md).
 
 The implementation verification plan is documented in [docs/sec-hosting-verification-plan.md](C:/work/projects/edgartools/docs/sec-hosting-verification-plan.md).
+Warehouse verification must report table-level result summaries; the detailed reporting
+contract lives in that verification plan.
 
 The AWS deployment guide is documented in [docs/guides/aws-warehouse-deployment.md](C:/work/projects/edgartools/docs/guides/aws-warehouse-deployment.md).
 
@@ -58,6 +60,9 @@ AWS deployment rules:
 - do not provision DynamoDB in v1
 - do not provision Glue or Athena in v1
 - do not require private networking in v1
+- `infra/terraform/accounts/dev` must be destroyable as a full account-root teardown
+- `infra/terraform/accounts/prod` must not be destroyable as a full account-root teardown because
+  the bronze bucket remains protected by `prevent_destroy`
 - declare `blocked_encryption_types = ["SSE-C"]` explicitly in all S3 encryption rules to match account-level enforcement and keep plans clean
 - CloudWatch failure alarms must cover all five Step Functions state machines, not only scheduled ones
 - `container_image` must default to `null` with `coalesce(var.container_image, "scratch")` in task definitions to allow a first apply before the ECR image exists
@@ -105,11 +110,19 @@ Container runtime rules:
 - Terraform deploys by image tag or digest; use immutable digest (`sha256:...`) in production
 - the container must expose the `edgar-warehouse` CLI entrypoint
 - install the package without the full analysis dependency tree and then add the curated warehouse runtime dependency set
+- build the deployable ECS image for `linux/amd64`
+- the repository must provide a reusable publish script and reference CI buildspec for the warehouse image
+- primary publish path is Linux-first direct `docker buildx build --push`
+- keep provenance and SBOM enabled on the primary publish path so ECR can store OCI referrers for the image
+- when publishing from Windows, treat `crane` as fallback-only and disable provenance and SBOM attestations before tar export
+- verify the pushed image digest in ECR before updating Terraform inputs or triggering workflows
+- for cold redeploys, recreate AWS infrastructure first, then publish and verify the image, then re-apply AWS so task definitions reference the verified digest
 - the warehouse runtime dependency set must include DuckDB, PyArrow, zstandard, `fsspec`, and the selected cloud filesystem package for the target environment
 - ECR repository must use `image_tag_mutability = "IMMUTABLE"` and `scan_on_push = true`
+- Amazon ECR managed signing is recommended for release repositories, but remains outside Terraform in v1
 - the Docker build must copy only the files required to install the package and execute `edgar-warehouse`
 - the `.dockerignore` file must exclude `.git`, `.venv`, `tests/`, `infra/`, `data/`, `docs/`, `examples/`, `scripts/`, `notebooks/`, local temp directories, and `**/.terraform` to keep the build context minimal
-- on Windows with Docker Desktop, the built-in HTTPS proxy (`192.168.65.1:3128`) drops large layer uploads (layers larger than ~40 MB); use `crane` (go-containerregistry) to push instead of `docker push` — save the image with `docker save <image> -o /tmp/image.tar` and push with `crane push /tmp/image.tar <ecr-uri>:<tag>`
+- on Windows with Docker Desktop, the built-in HTTPS proxy (`192.168.65.1:3128`) drops large layer uploads (layers larger than ~40 MB); treat `crane` (go-containerregistry) as fallback-only — save the image with `docker save <image> -o /tmp/image.tar` and push with `crane push /tmp/image.tar <ecr-uri>:<tag>`
 
 Step Functions input contract:
 
@@ -162,11 +175,12 @@ Snowflake operating rules:
 Current reference architecture:
 
 - canonical warehouse ECS tasks run in public subnets
-- Snowflake sync ECS tasks run in private subnets
 - AWS writes canonical bronze, staging, silver, and gold data into the warehouse S3 buckets
 - AWS writes one Snowflake export package per business table per run into a dedicated Snowflake export bucket
-- the Snowflake sync task reads runtime metadata from Secrets Manager and calls one public Snowflake wrapper
-- CloudWatch alarms separate true Step Functions failure from Snowflake stale or degraded mirror state
+- AWS writes one final immutable run manifest after all Snowflake export files for the run are durable
+- S3 object notifications on the manifests/ prefix publish to SNS for Snowpipe auto-ingest
+- Snowflake natively pulls the run manifest, loads EDGARTOOLS_SOURCE tables, and advances mirror status
+- CloudWatch alarms cover canonical Step Functions failures; Snowflake-native status and task history cover mirror freshness
 
 ```mermaid
 flowchart LR
@@ -175,31 +189,31 @@ flowchart LR
     wh --> bronze["Bronze bucket\nimmutable raw SEC artifacts"]
     wh --> warehouse["Warehouse bucket\nstaging, silver, canonical gold, artifacts"]
     wh --> export["Dedicated Snowflake export bucket\none package per business table per run"]
-    sfns --> sync["Private ECS Snowflake sync task"]
-    secret["Secrets Manager\nSnowflake runtime metadata"] --> sync
-    privkey["Secrets Manager\nSnowflake private key"] --> sync
-    export --> sync
-    sync --> wrapper["Snowflake wrapper\nCALL EDGARTOOLS_GOLD.REFRESH_AFTER_LOAD(...)"]
-    wrapper --> source["Snowflake EDGARTOOLS_SOURCE\nstage, file format, status, source load"]
-    wrapper --> gold["Snowflake EDGARTOOLS_GOLD\ncurated business tables and status view"]
+    wh --> manifest["Run manifest\nmanifests/workflow_name=.../run_id=..."]
+    manifest --> sns["SNS topic\nSnowflake manifest events"]
+    sns --> pipe["Snowpipe\nmanifest auto-ingest"]
+    pipe --> source["Snowflake EDGARTOOLS_SOURCE\nmanifest inbox, stream, status, source load"]
+    source --> task["Triggered Snowflake task"]
+    task --> wrapper["Snowflake wrapper\nCALL EDGARTOOLS_GOLD.REFRESH_AFTER_LOAD(...)"]
+    wrapper --> gold["Snowflake EDGARTOOLS_GOLD\ndbt-owned business models and status view"]
     gold --> users["Business readers"]
     sfns --> failalarm["CloudWatch workflow failure alarms"]
-    sync --> degradealarm["CloudWatch Snowflake degraded alarm"]
+    task --> snowobs["Snowflake task / copy / pipe history"]
 ```
 
 Snowflake build order:
 
 1. baseline platform objects: database, schemas, warehouses, account roles
-2. import path: storage integration, stage, file format, technical status table
-3. runtime SQL layer: source load procedure and public refresh wrapper
-4. authentication: generate RSA key pair, store private key in Secrets Manager, register public key on refresher user
-5. dbt layer: business-facing models, dynamic tables, tests, and `EDGARTOOLS_GOLD_STATUS`
-6. runtime cutover: replace infrastructure-validation mode with real Snowflake import and refresh
+2. import path: storage integration, stage, Parquet file format, manifest file format, manifest inbox table, and Snowpipe
+3. runtime SQL layer: manifest stream, source load procedure, refresh wrapper, and triggered task
+4. dbt layer: business-facing models, dynamic tables, tests, and `EDGARTOOLS_GOLD_STATUS`
+5. runtime cutover: replace AWS-managed Snowflake sync with Snowflake-native pull after export completion
 
 Preferred Snowflake E2E path:
 
 - AWS exports one package per business table per run into the dedicated Snowflake export bucket
-- Snowflake ingests from S3 through a Snowflake storage integration, not direct application credentials
+- AWS writes one final run manifest under the manifests/ prefix only after every Parquet package is durable
+- Snowflake ingests from S3 through a Snowflake storage integration, Snowpipe, streams, tasks, and procedures
 - one public wrapper call remains the AWS runtime contract:
   - `CALL EDGARTOOLS_GOLD.REFRESH_AFTER_LOAD(workflow_name, run_id)`
 - business users see only curated `EDGARTOOLS_GOLD` objects and the freshness view `EDGARTOOLS_GOLD_STATUS`
@@ -219,63 +233,25 @@ Five-whys rationale for the preferred path:
 4. Why use one refresh wrapper instead of many table-level commands? Because orchestration needs one stable contract with centralized retry, status, and cost control.
 5. Why use dynamic tables after the load rather than always-on refresh? Because post-load refresh gives better cost control and keeps freshness tied to canonical warehouse success.
 
-### Snowflake Authentication
+### Snowflake Pull Contract
 
-The Snowflake sync ECS task authenticates using RSA key-pair authentication. No passwords, tokens, or static credentials are stored in the runtime metadata secret.
+Snowflake no longer depends on an AWS-managed sync task or runtime-held Snowflake credentials.
 
-Authentication model:
+Pull model:
 
-- the ECS task's IAM role is the workload identity
-- the IAM role controls access to two Secrets Manager secrets:
-  - `SNOWFLAKE_RUNTIME_METADATA`: configuration-only (13 fields, no credentials)
-  - `SNOWFLAKE_PRIVATE_KEY`: PEM-encoded RSA private key for key-pair authentication
-- the `snowflake-connector-python` library uses key-pair auth with the user specified in the `refresher_user` metadata field
-- the matching RSA public key is registered on the Snowflake user via `ALTER USER ... SET RSA_PUBLIC_KEY`
-
-Secrets Manager layout per environment:
-
-| Secret | Contents | Managed by |
-|---|---|---|
-| `edgartools-<env>-snowflake-runtime` | JSON with 13 config fields | Terraform |
-| `edgartools-<env>-snowflake-private-key` | PEM-encoded RSA private key | Terraform (container), operator (value) |
-
-Key-pair lifecycle:
-
-- generate 2048-bit RSA key pair using `openssl genrsa` and `openssl pkcs8`
-- store private key PEM in Secrets Manager via `aws secretsmanager put-secret-value`
-- register public key on Snowflake user via `ALTER USER ... SET RSA_PUBLIC_KEY`
-- rotate using `RSA_PUBLIC_KEY_2` for zero-downtime key rotation
-- bootstrap script: `infra/snowflake/sql/bootstrap/05_refresher_keypair.sql`
-
-Runtime connector configuration:
-
-```python
-import snowflake.connector
-from cryptography.hazmat.primitives import serialization
-
-private_key = serialization.load_pem_private_key(pem_bytes, password=None)
-pkb = private_key.private_bytes(
-    encoding=serialization.Encoding.DER,
-    format=serialization.PrivateFormat.PKCS8,
-    encryption_algorithm=serialization.NoEncryption(),
-)
-
-conn = snowflake.connector.connect(
-    account=metadata["account"],
-    user=metadata["refresher_user"],
-    private_key=pkb,
-    role=metadata["runtime_role"],
-    warehouse=metadata["refresh_warehouse"],
-    database=metadata["database"],
-)
-```
+- AWS owns canonical fetch, parsing, silver, canonical gold, and export-package generation
+- AWS publishes the final run manifest to S3 only after all export files are durable
+- S3 publishes manifest events to SNS
+- Snowpipe auto-ingests manifest rows into `EDGARTOOLS_SOURCE`
+- a triggered Snowflake task processes pending manifests, calls `EDGARTOOLS_SOURCE.LOAD_EXPORTS_FOR_RUN(workflow_name, run_id)`, then calls `EDGARTOOLS_GOLD.REFRESH_AFTER_LOAD(workflow_name, run_id)`
+- dbt owns the `EDGARTOOLS_GOLD` model layer only; it does not own ingestion
 
 Rules:
 
-- `SNOWFLAKE_RUNTIME_METADATA` must never contain `password`, `private_key`, `token`, `secret`, or `client_secret` fields
-- `SNOWFLAKE_PRIVATE_KEY` is a dedicated secret injected as a separate ECS container secret
-- the private key is never logged, never included in runtime output, and never passed to Snowflake metadata validation
-- if `SNOWFLAKE_PRIVATE_KEY` is absent, the sync task must fail with a clear error, not fall back to password auth
+- AWS must not write the watched Snowflake run manifest during `infrastructure_validation`
+- Snowpipe listens only to the manifests/ prefix, never the full Parquet export tree
+- `SNOWFLAKE_REFRESH_STATUS` is per-run, keyed by `(environment, source_workflow, run_id)`
+- Snowflake mirror lag or failure must not fail the canonical AWS warehouse run
 
 ### Identifier Classes
 

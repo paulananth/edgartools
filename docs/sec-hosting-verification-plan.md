@@ -18,8 +18,32 @@ The SEC hosting implementation is not done until it has:
 - one verified documented example in `tests/test_documented_examples.py`
 - one silence check for each ingestion/parser boundary
 - recorded verification for every network-backed workflow
+- recorded verification evidence that includes table summaries for each asserted warehouse table:
+  `table`, ordered `columns`, and `row_count`
 - at least one live smoke test for each SEC endpoint family
 - regression coverage for each bug found during implementation
+
+## Verification Result Reporting
+
+Every warehouse integration, gold, and E2E verification that reads or writes warehouse tables
+must emit a per-table summary for each asserted table.
+
+Required fields:
+
+- `table`
+- `columns` in schema order
+- `row_count`
+
+This applies to both DuckDB-backed silver tables and Parquet-backed gold or Snowflake export
+tables. The shared warehouse verification helper should emit a stable single-line summary for
+each table it reports.
+
+Example output:
+
+```text
+TABLE sec_company | columns=cik,entity_name,entity_type,sic,sic_description,state_of_incorporation,state_of_incorporation_desc,fiscal_year_end,ein,description,category,first_sync_run_id,last_sync_run_id,last_synced_at | row_count=1
+TABLE fact_filing_activity | columns=fact_key,company_key,filing_key,date_key,form_key,accession_number,cik,form,filing_date,report_date,is_xbrl | row_count=3
+```
 
 ## Proposed Verification Files
 
@@ -45,6 +69,8 @@ Notes:
 - `tests/test_reference_sync.py` will auto-match the repo's fast pattern because of `test_reference`.
 - `tests/test_company_submissions_sync.py` and `tests/test_company_pagination_backfill.py` will auto-match network because of `test_company`.
 - `tests/test_adv_hosting.py`, `tests/test_storage_sec_hosting.py`, and `tests/test_parse_run_tracking.py` should use explicit markers because the filename alone will not be auto-classified reliably.
+- Warehouse-facing tests in these files should use the shared result-reporting helper after the
+  main assertions so runs can show `table`, `columns`, and `row_count`.
 
 ## Verification By Spec Workflow
 
@@ -194,22 +220,22 @@ Use this order during implementation:
 During implementation:
 
 ```bash
-hatch run test-fast
+uv run pytest -m fast -rA -s
 ```
 
 Before merging:
 
 ```bash
-hatch run test-network
-hatch run test-regression
+uv run pytest -m network -rA -s
+uv run pytest -m regression -rA -s
 ```
 
 For targeted development:
 
 ```bash
-hatch run test-fast -- tests/test_reference_sync.py
-hatch run test-network -- tests/test_company_submissions_sync.py
-hatch run test-network -- tests/test_adv_hosting.py
+uv run pytest -m fast -rA -s tests/test_reference_sync.py
+uv run pytest -m network -rA -s tests/test_company_submissions_sync.py
+uv run pytest -m network -rA -s tests/test_adv_hosting.py
 ```
 
 ## Important Repo-Specific Notes

@@ -61,23 +61,19 @@ variable "snowflake_export_kms_key_arn" {
   type        = string
 }
 
+variable "snowflake_manifest_subscriber_arn" {
+  description = "Optional Snowflake-managed AWS principal ARN allowed to subscribe to the manifest SNS topic for Snowpipe auto-ingest."
+  type        = string
+  default     = null
+}
+
 variable "public_subnet_ids" {
   description = "Public subnet IDs for canonical warehouse ECS tasks."
   type        = list(string)
 }
 
-variable "private_subnet_ids" {
-  description = "Private subnet IDs for Snowflake sync ECS tasks."
-  type        = list(string)
-}
-
 variable "public_security_group_id" {
   description = "Security group for public warehouse ECS tasks."
-  type        = string
-}
-
-variable "private_security_group_id" {
-  description = "Security group for private Snowflake sync ECS tasks."
   type        = string
 }
 
@@ -91,37 +87,6 @@ variable "edgar_identity_value" {
   description = "EDGAR identity string to store in Secrets Manager (e.g. 'MyApp admin@example.com'). Only used when edgar_identity_secret_arn is null (Terraform manages the secret)."
   type        = string
   sensitive   = true
-  default     = null
-}
-
-variable "snowflake_runtime_secret_arn" {
-  description = "Optional pre-existing Snowflake runtime metadata secret ARN."
-  type        = string
-  default     = null
-}
-
-variable "snowflake_account_identifier" {
-  description = "Snowflake account identifier used for WIF runtime metadata."
-  type        = string
-  default     = null
-}
-
-variable "snowflake_private_key_secret_arn" {
-  description = "Optional pre-existing Secrets Manager ARN for the Snowflake RSA private key. When null, Terraform creates the secret."
-  type        = string
-  default     = null
-}
-
-variable "snowflake_private_key_pem" {
-  description = "PEM-encoded RSA private key for Snowflake key-pair authentication. Only used when snowflake_private_key_secret_arn is null (Terraform manages the secret). Populate after generating a key pair."
-  type        = string
-  sensitive   = true
-  default     = null
-}
-
-variable "snowflake_storage_integration_name" {
-  description = "Snowflake storage integration used to import export artifacts from S3."
-  type        = string
   default     = null
 }
 
@@ -158,10 +123,16 @@ variable "task_profile_by_workflow" {
   default     = {}
 }
 
-variable "snowflake_task_profile_name" {
-  description = "Task profile name for the Snowflake sync runner."
-  type        = string
-  default     = "small"
+variable "ecr_force_delete" {
+  description = "Whether Terraform may delete the ECR repository even if images remain."
+  type        = bool
+  default     = false
+}
+
+variable "runner_user_force_destroy" {
+  description = "Whether Terraform may delete the runner IAM user even if out-of-band access keys exist."
+  type        = bool
+  default     = false
 }
 
 variable "tags" {
