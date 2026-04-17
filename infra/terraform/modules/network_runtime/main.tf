@@ -76,13 +76,15 @@ resource "aws_route_table_association" "public" {
 }
 
 resource "aws_eip" "nat" {
+  count  = length(var.private_subnet_cidrs) > 0 ? 1 : 0
   domain = "vpc"
 
   tags = merge(local.tags, { Name = "${var.name_prefix}-nat-eip" })
 }
 
 resource "aws_nat_gateway" "this" {
-  allocation_id = aws_eip.nat.id
+  count         = length(var.private_subnet_cidrs) > 0 ? 1 : 0
+  allocation_id = aws_eip.nat[0].id
   subnet_id     = aws_subnet.public["0"].id
 
   tags = merge(local.tags, { Name = "${var.name_prefix}-nat" })
@@ -91,11 +93,12 @@ resource "aws_nat_gateway" "this" {
 }
 
 resource "aws_route_table" "private" {
+  count  = length(var.private_subnet_cidrs) > 0 ? 1 : 0
   vpc_id = aws_vpc.this.id
 
   route {
     cidr_block     = "0.0.0.0/0"
-    nat_gateway_id = aws_nat_gateway.this.id
+    nat_gateway_id = aws_nat_gateway.this[0].id
   }
 
   tags = merge(local.tags, { Name = "${var.name_prefix}-private-rt" })
@@ -105,14 +108,14 @@ resource "aws_route_table_association" "private" {
   for_each = aws_subnet.private
 
   subnet_id      = each.value.id
-  route_table_id = aws_route_table.private.id
+  route_table_id = aws_route_table.private[0].id
 }
 
 resource "aws_vpc_endpoint" "s3" {
   vpc_id            = aws_vpc.this.id
   service_name      = "com.amazonaws.${data.aws_region.current.region}.s3"
   vpc_endpoint_type = "Gateway"
-  route_table_ids   = [aws_route_table.public.id, aws_route_table.private.id]
+  route_table_ids   = concat([aws_route_table.public.id], [for rt in aws_route_table.private : rt.id])
 
   tags = merge(local.tags, { Name = "${var.name_prefix}-s3-endpoint" })
 }
