@@ -18,12 +18,6 @@ variable "public_subnet_cidrs" {
   type        = list(string)
 }
 
-variable "private_subnet_cidrs" {
-  description = "CIDR blocks for private subnets used by the Snowflake runner. Empty list disables private subnets, NAT gateway, and private route table."
-  type        = list(string)
-  default     = []
-}
-
 variable "availability_zones" {
   description = "Availability zones matching the subnet CIDR lists."
   type        = list(string)

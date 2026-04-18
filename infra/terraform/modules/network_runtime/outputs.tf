@@ -8,19 +8,9 @@ output "public_subnet_ids" {
   value       = [for subnet in aws_subnet.public : subnet.id]
 }
 
-output "private_subnet_ids" {
-  description = "Private subnet IDs for Snowflake sync tasks."
-  value       = [for subnet in aws_subnet.private : subnet.id]
-}
-
 output "public_ecs_security_group_id" {
   description = "Security group ID for public ECS tasks."
   value       = aws_security_group.ecs_public_tasks.id
-}
-
-output "private_ecs_security_group_id" {
-  description = "Security group ID for private Snowflake ECS tasks."
-  value       = aws_security_group.ecs_private_snowflake.id
 }
 
 output "s3_vpc_endpoint_id" {
@@ -28,7 +18,3 @@ output "s3_vpc_endpoint_id" {
   value       = aws_vpc_endpoint.s3.id
 }
 
-output "nat_gateway_id" {
-  description = "NAT gateway ID for private Snowflake task egress. Null when no private subnets are configured."
-  value       = length(aws_nat_gateway.this) > 0 ? aws_nat_gateway.this[0].id : null
-}
