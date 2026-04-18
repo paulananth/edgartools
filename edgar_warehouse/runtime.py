@@ -18,7 +18,13 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from edgar_warehouse.artifacts import fetch_filing_artifacts
-from edgar_warehouse.gold import build_gold, write_gold_to_snowflake_export, write_gold_to_storage
+from edgar_warehouse.gold import (
+    build_gold,
+    build_ticker_reference_table,
+    write_gold_to_snowflake_export,
+    write_gold_to_storage,
+    write_ticker_reference_to_snowflake_export,
+)
 from edgar_warehouse.loaders import (
     seed_universe_loader,
     stage_address_loader,
@@ -46,6 +52,8 @@ GOLD_AFFECTING_COMMANDS = {
     "targeted-resync",
     "full-reconcile",
 }
+
+SNOWFLAKE_EXPORT_COMMANDS = GOLD_AFFECTING_COMMANDS | {"seed-universe"}
 
 SNOWFLAKE_EXPORT_TABLES = {
     "COMPANY": "company",
@@ -189,7 +197,7 @@ def _build_warehouse_context(command_name: str) -> WarehouseCommandContext:
         silver_root = storage_root
 
     snowflake_export_root = None
-    if command_name in GOLD_AFFECTING_COMMANDS:
+    if command_name in SNOWFLAKE_EXPORT_COMMANDS:
         snowflake_export_root_value = os.environ.get("SNOWFLAKE_EXPORT_ROOT", "").strip()
         if not snowflake_export_root_value:
             raise WarehouseRuntimeError("SNOWFLAKE_EXPORT_ROOT is required for gold-affecting warehouse commands")
@@ -392,6 +400,50 @@ def _execute_warehouse_bronze_capture(
             now=now,
             export_counts=snowflake_export_counts or {},
         )
+        snowflake_export_manifest_write = {
+            "layer": "snowflake_export_manifest",
+            "path": context.snowflake_export_root.write_json(run_manifest_relative_path, run_manifest),
+            "relative_path": run_manifest_relative_path,
+        }
+        writes.append(snowflake_export_manifest_write)
+
+    ticker_reference_rows = metrics.pop("_ticker_reference_rows", None)
+    if (
+        context.snowflake_export_root is not None
+        and command_name == "seed-universe"
+        and ticker_reference_rows is not None
+    ):
+        export_business_date = _resolve_export_business_date(command_name=command_name, scope=scope, now=now)
+        ticker_table = build_ticker_reference_table(ticker_reference_rows, run_id)
+        ticker_row_count = write_ticker_reference_to_snowflake_export(
+            ticker_table,
+            context.snowflake_export_root,
+            run_id,
+            export_business_date,
+        )
+        snowflake_export_counts = {"ticker_reference": ticker_row_count}
+        run_manifest_relative_path = _snowflake_export_run_manifest_relative_path(
+            workflow_name="seed_universe",
+            business_date=export_business_date,
+            run_id=run_id,
+        )
+        run_manifest = {
+            "business_date": export_business_date,
+            "completed_at": now.isoformat().replace("+00:00", "Z"),
+            "environment": context.environment_name,
+            "run_id": run_id,
+            "schema_version": 1,
+            "tables": [
+                _snowflake_export_run_manifest_table(
+                    table_name="TICKER_REFERENCE",
+                    table_path="ticker_reference",
+                    run_id=run_id,
+                    business_date=export_business_date,
+                    row_count=ticker_row_count,
+                )
+            ],
+            "workflow_name": "seed_universe",
+        }
         snowflake_export_manifest_write = {
             "layer": "snowflake_export_manifest",
             "path": context.snowflake_export_root.write_json(run_manifest_relative_path, run_manifest),
@@ -777,10 +829,23 @@ def _capture_bronze_raw(
             raw_object_id=reference_result["raw_writes"][0]["sha256"] if reference_result["raw_writes"] else "",
             load_mode="seed_universe",
         )
+        # Preserve the full per-ticker rows for TICKER_REFERENCE export (before dedup/cap).
+        ticker_reference_rows = list(universe_rows)
+        # SEC emits one row per ticker; dedupe to unique CIKs for batching.
+        seen_ciks: set[int] = set()
+        deduped_rows: list[dict[str, Any]] = []
+        for row in universe_rows:
+            cik = int(row["cik"])
+            if cik in seen_ciks:
+                continue
+            seen_ciks.add(cik)
+            deduped_rows.append(row)
+        universe_rows = deduped_rows
         limited_ciks = _apply_bronze_cik_limit([int(row["cik"]) for row in universe_rows])
         if len(limited_ciks) < len(universe_rows):
             allowed = set(limited_ciks)
             universe_rows = [row for row in universe_rows if int(row["cik"]) in allowed]
+        metrics["_ticker_reference_rows"] = ticker_reference_rows
         cik_universe_path = _write_cik_universe_batches(
             context=context,
             rows=universe_rows,
