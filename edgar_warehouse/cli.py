@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 
-from edgar_warehouse.runtime import run_command, run_seed_universe_command
+from edgar_warehouse.runtime import run_command
 
 
 def _parse_cik_list(value: str) -> list[int]:
@@ -98,7 +98,11 @@ def _handle_full_reconcile(args: argparse.Namespace) -> int:
 
 
 def _handle_seed_universe(args: argparse.Namespace) -> int:
-    return run_seed_universe_command(args)
+    return run_command("seed-universe", args)
+
+
+def _handle_bootstrap_batch(args: argparse.Namespace) -> int:
+    return run_command("bootstrap-batch", args)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -270,27 +274,36 @@ def build_parser() -> argparse.ArgumentParser:
 
     seed_universe = subparsers.add_parser(
         "seed-universe",
-        help="Seed the tracked company universe from a local or SEC reference JSON file.",
-    )
-    seed_universe.add_argument(
-        "--source-file",
-        help="Optional path to a company_tickers-style JSON file; when omitted, use the checked-in file if present or fetch the SEC reference",
-    )
-    seed_universe.add_argument(
-        "--storage-root",
-        help="Warehouse storage root used to derive the silver DuckDB location",
-    )
-    seed_universe.add_argument(
-        "--silver-root",
-        help="Explicit local silver root; overrides --storage-root and WAREHOUSE_STORAGE_ROOT",
-    )
-    seed_universe.add_argument(
-        "--limit",
-        type=int,
-        help="Optional maximum number of companies to seed from the source file",
+        help="Fetch company_tickers_exchange.json and write CIK universe to S3 as pre-batched JSON Lines.",
     )
     _add_run_id_arg(seed_universe)
     seed_universe.set_defaults(handler=_handle_seed_universe)
+
+    bootstrap_batch = subparsers.add_parser(
+        "bootstrap-batch",
+        help="Bootstrap a specific batch of CIKs (one Distributed Map iteration).",
+    )
+    bootstrap_batch.add_argument(
+        "--cik-list",
+        type=_parse_cik_list,
+        required=True,
+        help="Comma-separated CIK integers for this batch",
+    )
+    bootstrap_batch.add_argument(
+        "--include-pagination",
+        dest="include_pagination",
+        action="store_true",
+        default=True,
+        help="Fetch full filing history including pagination files",
+    )
+    bootstrap_batch.add_argument(
+        "--no-include-pagination",
+        dest="include_pagination",
+        action="store_false",
+        help="Skip pagination files (recent filings only)",
+    )
+    _add_run_id_arg(bootstrap_batch)
+    bootstrap_batch.set_defaults(handler=_handle_bootstrap_batch)
 
     return parser
 

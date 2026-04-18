@@ -67,6 +67,14 @@ _DIM_COMPANY_SCHEMA = pa.schema(
         pa.field("last_sync_run_id", pa.string()),
     ]
 )
+_DIM_TICKER_REFERENCE_SCHEMA = pa.schema(
+    [
+        pa.field("cik", pa.int64()),
+        pa.field("ticker", pa.string()),
+        pa.field("exchange", pa.string()),
+        pa.field("last_sync_run_id", pa.string()),
+    ]
+)
 _DIM_FORM_SCHEMA = pa.schema(
     [
         pa.field("form_key", pa.int64()),
@@ -936,6 +944,40 @@ def write_gold_to_storage(tables: dict[str, pa.Table], storage_root: Any, run_id
         _write_parquet(table, storage_root, relative_path)
         counts[table_name] = table.num_rows
     return counts
+
+
+def build_ticker_reference_table(
+    universe_rows: list[dict[str, Any]], sync_run_id: str
+) -> pa.Table:
+    """Project seed-universe rows into the TICKER_REFERENCE gold schema."""
+    records: list[dict[str, Any]] = []
+    for row in universe_rows:
+        cik = row.get("cik")
+        ticker = row.get("ticker")
+        if cik is None or not ticker:
+            continue
+        records.append(
+            {
+                "cik": int(cik),
+                "ticker": str(ticker),
+                "exchange": row.get("exchange"),
+                "last_sync_run_id": sync_run_id,
+            }
+        )
+    return _table_from_records(_DIM_TICKER_REFERENCE_SCHEMA, records)
+
+
+def write_ticker_reference_to_snowflake_export(
+    table: pa.Table,
+    export_root: Any,
+    run_id: str,
+    business_date: str,
+) -> int:
+    relative_path = (
+        f"ticker_reference/business_date={business_date}/run_id={run_id}/ticker_reference.parquet"
+    )
+    _write_parquet(table, export_root, relative_path)
+    return table.num_rows
 
 
 def write_gold_to_snowflake_export(

@@ -18,8 +18,15 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from edgar_warehouse.artifacts import fetch_filing_artifacts
-from edgar_warehouse.gold import build_gold, write_gold_to_snowflake_export, write_gold_to_storage
+from edgar_warehouse.gold import (
+    build_gold,
+    build_ticker_reference_table,
+    write_gold_to_snowflake_export,
+    write_gold_to_storage,
+    write_ticker_reference_to_snowflake_export,
+)
 from edgar_warehouse.loaders import (
+    seed_universe_loader,
     stage_address_loader,
     stage_company_loader,
     stage_daily_index_filing_loader,
@@ -40,10 +47,13 @@ from edgar_warehouse.text_extraction import extract_text_for_accession
 GOLD_AFFECTING_COMMANDS = {
     "bootstrap-full",
     "bootstrap-recent-10",
+    "bootstrap-batch",
     "daily-incremental",
     "targeted-resync",
     "full-reconcile",
 }
+
+SNOWFLAKE_EXPORT_COMMANDS = GOLD_AFFECTING_COMMANDS | {"seed-universe"}
 
 SNOWFLAKE_EXPORT_TABLES = {
     "COMPANY": "company",
@@ -238,7 +248,7 @@ def _build_warehouse_context(command_name: str) -> WarehouseCommandContext:
         silver_root = storage_root
 
     snowflake_export_root = None
-    if command_name in GOLD_AFFECTING_COMMANDS:
+    if command_name in SNOWFLAKE_EXPORT_COMMANDS:
         snowflake_export_root_value = os.environ.get("SNOWFLAKE_EXPORT_ROOT", "").strip()
         if not snowflake_export_root_value:
             raise WarehouseRuntimeError("SNOWFLAKE_EXPORT_ROOT is required for gold-affecting warehouse commands")
@@ -255,82 +265,6 @@ def _build_warehouse_context(command_name: str) -> WarehouseCommandContext:
         identity=identity,
         runtime_mode=runtime_mode,
     )
-
-
-def _resolve_seed_source_file(raw_path: Any) -> Path:
-    source_value = str(raw_path or "data/company_tickers.json").strip()
-    source_path = Path(source_value)
-    if not source_path.is_absolute():
-        source_path = Path.cwd() / source_path
-    if not source_path.exists():
-        raise WarehouseRuntimeError(f"seed-universe source file does not exist: {source_path}")
-    return source_path
-
-
-def _read_seed_document(source_file: Path) -> dict[str, Any]:
-    try:
-        payload = json.loads(source_file.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise WarehouseRuntimeError(f"Unable to read JSON from {source_file}") from exc
-    if not isinstance(payload, dict):
-        raise WarehouseRuntimeError(f"Expected a JSON object in {source_file}")
-    return payload
-
-
-def _resolve_seed_document(args: Any) -> tuple[str, dict[str, Any]]:
-    raw_source_file = getattr(args, "source_file", None)
-    if raw_source_file:
-        source_file = _resolve_seed_source_file(raw_source_file)
-        return (str(source_file), _read_seed_document(source_file))
-
-    default_local = Path.cwd() / "data" / "company_tickers.json"
-    if default_local.exists():
-        return (str(default_local), _read_seed_document(default_local))
-
-    identity = os.environ.get("EDGAR_IDENTITY", "").strip()
-    if not identity:
-        raise WarehouseRuntimeError(
-            "seed-universe requires --source-file when EDGAR_IDENTITY is not configured"
-        )
-    source_url = _build_company_tickers_exchange_url()
-    payload = _download_sec_bytes(url=source_url, identity=identity)
-    return (source_url, _decode_json_bytes(payload, source_url))
-
-
-def _resolve_seed_limit(raw_limit: Any) -> int | None:
-    if raw_limit is None:
-        return None
-    limit = int(raw_limit)
-    if limit <= 0:
-        raise WarehouseRuntimeError("--limit must be greater than zero")
-    return limit
-
-
-def _resolve_seed_silver_root(args: Any) -> str:
-    explicit_silver_root = str(getattr(args, "silver_root", "") or "").strip()
-    if explicit_silver_root:
-        silver_root = StorageLocation(explicit_silver_root)
-        if silver_root.is_remote:
-            raise WarehouseRuntimeError("seed-universe requires a local --silver-root")
-        return silver_root.root
-
-    silver_root_value = os.environ.get("WAREHOUSE_SILVER_ROOT", "").strip()
-    if silver_root_value:
-        silver_root = StorageLocation(silver_root_value)
-        if silver_root.is_remote:
-            raise WarehouseRuntimeError("WAREHOUSE_SILVER_ROOT must be a local path for seed-universe")
-        return silver_root.root
-
-    storage_root_value = str(getattr(args, "storage_root", "") or "").strip() or os.environ.get(
-        "WAREHOUSE_STORAGE_ROOT", ""
-    ).strip()
-    if storage_root_value:
-        storage_root = StorageLocation(storage_root_value)
-        if storage_root.is_remote:
-            return StorageLocation("/tmp/edgar-warehouse-silver").root
-        return storage_root.root
-
-    return str((Path.cwd() / ".tmp" / "warehouse-root" / "warehouse").resolve())
 
 
 def _execute_warehouse(
@@ -524,6 +458,50 @@ def _execute_warehouse_bronze_capture(
         }
         writes.append(snowflake_export_manifest_write)
 
+    ticker_reference_rows = metrics.pop("_ticker_reference_rows", None)
+    if (
+        context.snowflake_export_root is not None
+        and command_name == "seed-universe"
+        and ticker_reference_rows is not None
+    ):
+        export_business_date = _resolve_export_business_date(command_name=command_name, scope=scope, now=now)
+        ticker_table = build_ticker_reference_table(ticker_reference_rows, run_id)
+        ticker_row_count = write_ticker_reference_to_snowflake_export(
+            ticker_table,
+            context.snowflake_export_root,
+            run_id,
+            export_business_date,
+        )
+        snowflake_export_counts = {"ticker_reference": ticker_row_count}
+        run_manifest_relative_path = _snowflake_export_run_manifest_relative_path(
+            workflow_name="seed_universe",
+            business_date=export_business_date,
+            run_id=run_id,
+        )
+        run_manifest = {
+            "business_date": export_business_date,
+            "completed_at": now.isoformat().replace("+00:00", "Z"),
+            "environment": context.environment_name,
+            "run_id": run_id,
+            "schema_version": 1,
+            "tables": [
+                _snowflake_export_run_manifest_table(
+                    table_name="TICKER_REFERENCE",
+                    table_path="ticker_reference",
+                    run_id=run_id,
+                    business_date=export_business_date,
+                    row_count=ticker_row_count,
+                )
+            ],
+            "workflow_name": "seed_universe",
+        }
+        snowflake_export_manifest_write = {
+            "layer": "snowflake_export_manifest",
+            "path": context.snowflake_export_root.write_json(run_manifest_relative_path, run_manifest),
+            "relative_path": run_manifest_relative_path,
+        }
+        writes.append(snowflake_export_manifest_write)
+
     return {
         "arguments": arguments,
         "bronze_object_count": len(raw_writes),
@@ -556,6 +534,8 @@ def _execute_warehouse_bronze_capture(
         "started_at": now.isoformat().replace("+00:00", "Z"),
         "status": "ok",
         "writes": writes,
+        "cik_universe_path": metrics.get("cik_universe_path"),
+        "cik_count": metrics.get("cik_count"),
     }
 
 
@@ -883,6 +863,70 @@ def _capture_bronze_raw(
             metrics["sync_status"] = "partial"
         return raw_writes, metrics
 
+    if command_name == "seed-universe":
+        reference_result = _sync_reference_data(
+            context=context,
+            db=db,
+            sync_run_id=sync_run_id,
+            fetch_date=now.date(),
+        )
+        raw_writes.extend(reference_result["raw_writes"])
+        metrics["rows_inserted"] += reference_result["rows_written"]
+        metrics["rows_skipped"] += reference_result["rows_skipped"]
+        seed_document = reference_result.get("seed_document") or {}
+        universe_rows = seed_universe_loader(
+            seed_document,
+            sync_run_id=sync_run_id,
+            raw_object_id=reference_result["raw_writes"][0]["sha256"] if reference_result["raw_writes"] else "",
+            load_mode="seed_universe",
+        )
+        # Preserve the full per-ticker rows for TICKER_REFERENCE export (before dedup/cap).
+        ticker_reference_rows = list(universe_rows)
+        # SEC emits one row per ticker; dedupe to unique CIKs for batching.
+        seen_ciks: set[int] = set()
+        deduped_rows: list[dict[str, Any]] = []
+        for row in universe_rows:
+            cik = int(row["cik"])
+            if cik in seen_ciks:
+                continue
+            seen_ciks.add(cik)
+            deduped_rows.append(row)
+        universe_rows = deduped_rows
+        limited_ciks = _apply_bronze_cik_limit([int(row["cik"]) for row in universe_rows])
+        if len(limited_ciks) < len(universe_rows):
+            allowed = set(limited_ciks)
+            universe_rows = [row for row in universe_rows if int(row["cik"]) in allowed]
+        metrics["_ticker_reference_rows"] = ticker_reference_rows
+        cik_universe_path = _write_cik_universe_batches(
+            context=context,
+            rows=universe_rows,
+            fetch_date=now.date(),
+            sync_run_id=sync_run_id,
+            batch_size=100,
+        )
+        metrics["cik_universe_path"] = cik_universe_path
+        metrics["cik_count"] = len(universe_rows)
+        return raw_writes, metrics
+
+    if command_name == "bootstrap-batch":
+        cik_list = list(arguments.get("cik_list") or [])
+        include_pagination = bool(arguments.get("include_pagination", True))
+        for cik in cik_list:
+            result = submissions_orchestrator(
+                context=context,
+                db=db,
+                sync_run_id=sync_run_id,
+                cik=cik,
+                include_pagination=include_pagination,
+                fetch_date=now.date(),
+                force=bool(arguments.get("force", False)),
+                load_mode="bootstrap_batch",
+            )
+            raw_writes.extend(result["raw_writes"])
+            metrics["rows_inserted"] += result["rows_written"]
+            metrics["rows_skipped"] += result["rows_skipped"]
+        return raw_writes, metrics
+
     raise WarehouseRuntimeError(f"bronze_capture mode does not support {command_name}")
 
 
@@ -1111,7 +1155,39 @@ def _sync_reference_data(
 
     if seed_document is not None:
         db.seed_tracked_universe(seed_document)
-    return {"raw_writes": raw_writes, "rows_written": rows_written, "rows_skipped": rows_skipped}
+    return {
+        "raw_writes": raw_writes,
+        "rows_written": rows_written,
+        "rows_skipped": rows_skipped,
+        "seed_document": seed_document,
+    }
+
+
+def _write_cik_universe_batches(
+    context: WarehouseCommandContext,
+    rows: list[dict[str, Any]],
+    fetch_date: date,
+    sync_run_id: str,
+    batch_size: int = 100,
+) -> str:
+    """Write the CIK universe as pre-batched JSON Lines to the bronze root.
+
+    Each line is {"cik_list": "cik1,cik2,..."} for use by the Distributed Map
+    bootstrap-batch iterator.
+
+    Path uses run_id only (no date component) so the Step Function can construct
+    the key deterministically from $$.Execution.Name without date extraction.
+
+    Returns the full S3/local path to the JSON Lines file.
+    """
+    relative_path = f"reference/cik_universe/runs/{sync_run_id}/cik_batches.jsonl"
+    lines = []
+    ciks = [str(row["cik"]) for row in rows]
+    for i in range(0, len(ciks), batch_size):
+        batch = ciks[i : i + batch_size]
+        lines.append(json.dumps({"cik_list": ",".join(batch)}))
+    content = "\n".join(lines) + ("\n" if lines else "")
+    return context.bronze_root.write_text(relative_path, content)
 
 
 def _reference_sources_for_scope(scope_key: str) -> list[str]:
@@ -1927,7 +2003,7 @@ def _date_range(start: date, end: date) -> list[date]:
 
 
 def _sync_mode_for_command(command_name: str) -> str:
-    if command_name in {"bootstrap-full", "bootstrap-recent-10"}:
+    if command_name in {"bootstrap-full", "bootstrap-recent-10", "bootstrap-batch"}:
         return "bootstrap"
     if command_name in {"daily-incremental", "load-daily-form-index-for-date", "catch-up-daily-form-index"}:
         return "incremental"
@@ -1935,14 +2011,18 @@ def _sync_mode_for_command(command_name: str) -> str:
         return "resync"
     if command_name == "full-reconcile":
         return "reconcile"
+    if command_name == "seed-universe":
+        return "incremental"
     return "incremental"
 
 
 def _sync_scope_type_for_command(command_name: str, scope: dict[str, Any]) -> str:
     if command_name in {"daily-incremental", "load-daily-form-index-for-date", "catch-up-daily-form-index"}:
         return "daily_index"
-    if command_name in {"bootstrap-full", "bootstrap-recent-10"}:
+    if command_name in {"bootstrap-full", "bootstrap-recent-10", "bootstrap-batch"}:
         return "submissions"
+    if command_name == "seed-universe":
+        return "reference"
     if command_name == "targeted-resync":
         scope_type = str(scope.get("scope_type", "")).strip()
         if scope_type == "cik":
@@ -1965,6 +2045,11 @@ def _sync_scope_key_for_command(command_name: str, scope: dict[str, Any]) -> str
     if command_name == "targeted-resync":
         return str(scope.get("scope_key") or "")
     if command_name == "full-reconcile":
+        cik_list = scope.get("cik_list") or []
+        return ",".join(str(value) for value in cik_list) or None
+    if command_name == "seed-universe":
+        return "company_tickers_exchange"
+    if command_name == "bootstrap-batch":
         cik_list = scope.get("cik_list") or []
         return ",".join(str(value) for value in cik_list) or None
     cik_list = scope.get("cik_list") or []
@@ -2037,6 +2122,15 @@ def _resolve_scope(
             "sample_limit": arguments.get("sample_limit"),
         }
 
+    if command_name == "seed-universe":
+        return {"run_date": now.date().isoformat()}
+
+    if command_name == "bootstrap-batch":
+        return {
+            "cik_list": arguments.get("cik_list") or [],
+            "include_pagination": arguments.get("include_pagination", True),
+        }
+
     raise WarehouseRuntimeError(f"Unsupported warehouse command: {command_name}")
 
 
@@ -2047,11 +2141,18 @@ def _planned_writes(command_name: str, command_path: str, run_id: str, scope: di
         "staging": f"staging/runs/{command_path}/{run_id}/manifest.json",
     }
 
-    if command_name in {"bootstrap-recent-10", "bootstrap-full", "daily-incremental", "targeted-resync", "full-reconcile"}:
+    if command_name in {"bootstrap-recent-10", "bootstrap-full", "bootstrap-batch", "daily-incremental", "targeted-resync", "full-reconcile"}:
         shared["silver"] = f"silver/sec/runs/{command_path}/{run_id}/manifest.json"
         shared["gold"] = f"gold/runs/{command_path}/{run_id}/manifest.json"
         shared["bronze"] = bronze_rel
         return {key: shared[key] for key in ("bronze", "staging", "silver", "gold", "artifacts")}
+
+    if command_name == "seed-universe":
+        return {
+            "bronze": bronze_rel,
+            "staging": shared["staging"],
+            "artifacts": shared["artifacts"],
+        }
 
     if command_name == "load-daily-form-index-for-date":
         target_date = scope["target_date"]

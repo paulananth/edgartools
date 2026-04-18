@@ -37,11 +37,12 @@ locals {
     daily_incremental              = "medium"
     bootstrap_recent_10            = "medium"
     bootstrap_full                 = "large"
-    seed_universe                  = "small"
     targeted_resync                = "small"
     full_reconcile                 = "medium"
     load_daily_form_index_for_date = "small"
     catch_up_daily_form_index      = "small"
+    seed_universe                  = "small"
+    bootstrap_batch                = "medium"
   }
 
   task_profile_by_workflow = merge(local.default_task_profile_by_workflow, var.task_profile_by_workflow)
@@ -101,6 +102,13 @@ locals {
       schedule_expression                        = null
       gold_affecting                             = false
       warehouse_command_expression               = "States.Array('catch-up-daily-form-index', '--run-id', $$.Execution.Name)"
+      warehouse_command_with_cik_list_expression = null
+    }
+    seed_universe = {
+      task_profile                               = local.task_profile_by_workflow.seed_universe
+      schedule_expression                        = null
+      gold_affecting                             = false
+      warehouse_command_expression               = "States.Array('seed-universe', '--run-id', $$.Execution.Name)"
       warehouse_command_with_cik_list_expression = null
     }
   }
@@ -600,6 +608,26 @@ resource "aws_iam_role_policy" "step_functions_runtime" {
           "logs:DescribeLogGroups"
         ]
         Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          var.bronze_bucket_arn,
+          "${var.bronze_bucket_arn}/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "states:StartExecution",
+          "states:DescribeExecution",
+          "states:StopExecution"
+        ]
+        Resource = "*"
       }
     ]
   })
@@ -635,6 +663,30 @@ resource "aws_sfn_state_machine" "workflow" {
   }
 
   tags = merge(local.tags, { Workflow = each.key })
+}
+
+resource "aws_sfn_state_machine" "bootstrap_batched" {
+  name     = "${local.name_prefix}-bootstrap-batched"
+  role_arn = aws_iam_role.step_functions.arn
+
+  definition = templatefile("${path.module}/templates/ecs_distributed_map_bootstrap.asl.json.tmpl", {
+    cluster_arn                     = aws_ecs_cluster.warehouse.arn
+    seed_task_definition_arn        = aws_ecs_task_definition.warehouse[local.task_profile_by_workflow.seed_universe].arn
+    batch_task_definition_arn       = aws_ecs_task_definition.warehouse[local.task_profile_by_workflow.bootstrap_batch].arn
+    container_name                  = local.container_name
+    bronze_bucket_name              = var.bronze_bucket_name
+    subnets_json                    = jsonencode(var.public_subnet_ids)
+    security_groups_json            = jsonencode([var.public_security_group_id])
+    batch_concurrency               = var.bootstrap_batch_concurrency
+  })
+
+  logging_configuration {
+    include_execution_data = true
+    level                  = "ALL"
+    log_destination        = "${aws_cloudwatch_log_group.step_functions.arn}:*"
+  }
+
+  tags = merge(local.tags, { Workflow = "bootstrap_batched" })
 }
 
 resource "aws_iam_role" "scheduler" {

@@ -21,5 +21,7 @@ sources:
         description: Current private-fund source table loaded natively by Snowflake from the AWS export manifest.
       - name: FILING_DETAIL
         description: Current filing-detail source table loaded natively by Snowflake from the AWS export manifest.
+      - name: TICKER_REFERENCE
+        description: CIK-to-ticker reference table loaded natively by Snowflake from the seed-universe export manifest.
       - name: SNOWFLAKE_REFRESH_STATUS
         description: Per-run Snowflake-native load and refresh status table populated by SnowCLI bootstrap procedures and tasks.
