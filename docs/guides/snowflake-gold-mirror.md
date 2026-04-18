@@ -107,6 +107,19 @@ dbt owns:
 
 Terraform and SnowCLI do not own ongoing gold-model evolution.
 
+## Manual steps required before dbt can run
+
+The following objects must exist before dbt models can materialize. They are created by the bootstrap driver, not by Terraform or dbt:
+
+- `EDGARTOOLS_SOURCE.SNOWFLAKE_REFRESH_STATUS` — dbt gold status model sources from this table; bootstrap must succeed before first dbt run
+- Storage integration, external stage, Snowpipe, manifest stream, manifest task — all created by the bootstrap driver
+
+**SNS topic subscription:** After Terraform creates the SNS manifest topic and after the bootstrap creates the Snowpipe, the Snowpipe's SQS queue must be subscribed to the SNS topic. This step is not automated:
+
+1. Get the Snowpipe SQS ARN: `SHOW PIPES LIKE 'SNOWFLAKE_RUN_MANIFEST_PIPE' IN SCHEMA EDGARTOOLS_SOURCE;` — read `notification_channel`
+2. In AWS console or CLI, add that SQS ARN as a subscriber to the SNS topic `edgartools-<env>-snowflake-manifest-events`
+3. Confirm the subscription in SQS
+
 ## Bootstrap driver
 
 The preferred operator path is the SnowCLI bootstrap driver:
