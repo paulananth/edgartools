@@ -37,6 +37,7 @@ locals {
     daily_incremental              = "medium"
     bootstrap_recent_10            = "medium"
     bootstrap_full                 = "large"
+    seed_universe                  = "small"
     targeted_resync                = "small"
     full_reconcile                 = "medium"
     load_daily_form_index_for_date = "small"
@@ -66,6 +67,13 @@ locals {
       gold_affecting                             = true
       warehouse_command_expression               = "States.Array('bootstrap-full', '--run-id', $$.Execution.Name)"
       warehouse_command_with_cik_list_expression = "States.Array('bootstrap-full', '--run-id', $$.Execution.Name, '--cik-list', $.cik_list)"
+    }
+    seed_universe = {
+      task_profile                               = local.task_profile_by_workflow.seed_universe
+      schedule_expression                        = null
+      gold_affecting                             = false
+      warehouse_command_expression               = "States.Array('seed-universe', '--run-id', $$.Execution.Name)"
+      warehouse_command_with_cik_list_expression = null
     }
     targeted_resync = {
       task_profile                               = local.task_profile_by_workflow.targeted_resync

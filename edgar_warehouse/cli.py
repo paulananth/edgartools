@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 
-from edgar_warehouse.runtime import run_command
+from edgar_warehouse.runtime import run_command, run_seed_universe_command
 
 
 def _parse_cik_list(value: str) -> list[int]:
@@ -95,6 +95,10 @@ def _handle_targeted_resync(args: argparse.Namespace) -> int:
 
 def _handle_full_reconcile(args: argparse.Namespace) -> int:
     return run_command("full-reconcile", args)
+
+
+def _handle_seed_universe(args: argparse.Namespace) -> int:
+    return run_seed_universe_command(args)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -263,6 +267,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_run_id_arg(full_reconcile)
     full_reconcile.set_defaults(handler=_handle_full_reconcile)
+
+    seed_universe = subparsers.add_parser(
+        "seed-universe",
+        help="Seed the tracked company universe from a local or SEC reference JSON file.",
+    )
+    seed_universe.add_argument(
+        "--source-file",
+        help="Optional path to a company_tickers-style JSON file; when omitted, use the checked-in file if present or fetch the SEC reference",
+    )
+    seed_universe.add_argument(
+        "--storage-root",
+        help="Warehouse storage root used to derive the silver DuckDB location",
+    )
+    seed_universe.add_argument(
+        "--silver-root",
+        help="Explicit local silver root; overrides --storage-root and WAREHOUSE_STORAGE_ROOT",
+    )
+    seed_universe.add_argument(
+        "--limit",
+        type=int,
+        help="Optional maximum number of companies to seed from the source file",
+    )
+    _add_run_id_arg(seed_universe)
+    seed_universe.set_defaults(handler=_handle_seed_universe)
 
     return parser
 

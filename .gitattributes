@@ -3,6 +3,7 @@ workbooks/** -linguist-detectable
 notebooks/** -linguist-detectable
 docs/* linguist-documentation
 *.html linguist-vendored
+*.sh text eol=lf
 
 
 # Use bd merge for beads JSONL files

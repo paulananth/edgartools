@@ -147,6 +147,57 @@ def run_command(command_name: str, args: Any) -> int:
     return 0
 
 
+def run_seed_universe_command(args: Any) -> int:
+    """Seed the tracked-universe table from a local SEC reference JSON file."""
+    try:
+        limit = _resolve_seed_limit(getattr(args, "limit", None))
+        silver_root = _resolve_seed_silver_root(args)
+        source_label, document = _resolve_seed_document(args)
+        rows = _parse_company_ticker_rows(document)
+        if not rows:
+            raise WarehouseRuntimeError(f"No company ticker rows found in {source_label}")
+        if limit is not None:
+            rows = rows[:limit]
+
+        db = _open_silver_database(StorageLocation(silver_root))
+        try:
+            rows_seeded = db.seed_tracked_universe_rows(rows)
+            tracked_universe_count = db.get_tracked_universe_count()
+        finally:
+            db.close()
+    except WarehouseRuntimeError as exc:
+        print(
+            json.dumps(
+                {
+                    "command": "seed-universe",
+                    "message": str(exc),
+                    "status": "error",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 2
+
+    print(
+        json.dumps(
+            {
+                "command": "seed-universe",
+                "limit": limit,
+                "rows_seeded": rows_seeded,
+                "run_id": getattr(args, "run_id", None),
+                "silver_db_path": str(Path(silver_root) / "silver" / "sec" / "silver.duckdb"),
+                "source": source_label,
+                "status": "ok",
+                "tracked_universe_count": tracked_universe_count,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def _build_warehouse_context(command_name: str) -> WarehouseCommandContext:
     identity = os.environ.get("EDGAR_IDENTITY", "").strip()
     if not identity:
@@ -204,6 +255,82 @@ def _build_warehouse_context(command_name: str) -> WarehouseCommandContext:
         identity=identity,
         runtime_mode=runtime_mode,
     )
+
+
+def _resolve_seed_source_file(raw_path: Any) -> Path:
+    source_value = str(raw_path or "data/company_tickers.json").strip()
+    source_path = Path(source_value)
+    if not source_path.is_absolute():
+        source_path = Path.cwd() / source_path
+    if not source_path.exists():
+        raise WarehouseRuntimeError(f"seed-universe source file does not exist: {source_path}")
+    return source_path
+
+
+def _read_seed_document(source_file: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(source_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WarehouseRuntimeError(f"Unable to read JSON from {source_file}") from exc
+    if not isinstance(payload, dict):
+        raise WarehouseRuntimeError(f"Expected a JSON object in {source_file}")
+    return payload
+
+
+def _resolve_seed_document(args: Any) -> tuple[str, dict[str, Any]]:
+    raw_source_file = getattr(args, "source_file", None)
+    if raw_source_file:
+        source_file = _resolve_seed_source_file(raw_source_file)
+        return (str(source_file), _read_seed_document(source_file))
+
+    default_local = Path.cwd() / "data" / "company_tickers.json"
+    if default_local.exists():
+        return (str(default_local), _read_seed_document(default_local))
+
+    identity = os.environ.get("EDGAR_IDENTITY", "").strip()
+    if not identity:
+        raise WarehouseRuntimeError(
+            "seed-universe requires --source-file when EDGAR_IDENTITY is not configured"
+        )
+    source_url = _build_company_tickers_exchange_url()
+    payload = _download_sec_bytes(url=source_url, identity=identity)
+    return (source_url, _decode_json_bytes(payload, source_url))
+
+
+def _resolve_seed_limit(raw_limit: Any) -> int | None:
+    if raw_limit is None:
+        return None
+    limit = int(raw_limit)
+    if limit <= 0:
+        raise WarehouseRuntimeError("--limit must be greater than zero")
+    return limit
+
+
+def _resolve_seed_silver_root(args: Any) -> str:
+    explicit_silver_root = str(getattr(args, "silver_root", "") or "").strip()
+    if explicit_silver_root:
+        silver_root = StorageLocation(explicit_silver_root)
+        if silver_root.is_remote:
+            raise WarehouseRuntimeError("seed-universe requires a local --silver-root")
+        return silver_root.root
+
+    silver_root_value = os.environ.get("WAREHOUSE_SILVER_ROOT", "").strip()
+    if silver_root_value:
+        silver_root = StorageLocation(silver_root_value)
+        if silver_root.is_remote:
+            raise WarehouseRuntimeError("WAREHOUSE_SILVER_ROOT must be a local path for seed-universe")
+        return silver_root.root
+
+    storage_root_value = str(getattr(args, "storage_root", "") or "").strip() or os.environ.get(
+        "WAREHOUSE_STORAGE_ROOT", ""
+    ).strip()
+    if storage_root_value:
+        storage_root = StorageLocation(storage_root_value)
+        if storage_root.is_remote:
+            return StorageLocation("/tmp/edgar-warehouse-silver").root
+        return storage_root.root
+
+    return str((Path.cwd() / ".tmp" / "warehouse-root" / "warehouse").resolve())
 
 
 def _execute_warehouse(
