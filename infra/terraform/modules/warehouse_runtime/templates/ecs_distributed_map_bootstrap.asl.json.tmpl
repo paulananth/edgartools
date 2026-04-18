@@ -42,12 +42,12 @@
       "ItemReader": {
         "Resource": "arn:aws:states:::s3:getObject",
         "ReaderConfig": {
-          "Format": "JSONL",
+          "InputType": "JSONL",
           "MaxItems": 100000
         },
         "Parameters": {
           "Bucket": "${bronze_bucket_name}",
-          "Key.$": "States.Format('reference/cik_universe/runs/{}/cik_batches.jsonl', $$.Execution.Name)"
+          "Key.$": "States.Format('warehouse/bronze/reference/cik_universe/runs/{}/cik_batches.jsonl', $$.Execution.Name)"
         }
       },
       "ItemProcessor": {

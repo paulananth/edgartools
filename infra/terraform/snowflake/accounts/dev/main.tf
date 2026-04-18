@@ -29,3 +29,13 @@ module "baseline" {
   grant_roles_to_admin           = var.grant_roles_to_admin
   parent_admin_role_name         = var.parent_admin_role_name
 }
+
+module "dashboard" {
+  source = "../../modules/dashboard"
+
+  environment           = local.environment
+  database_name         = module.baseline.database_name
+  gold_schema_name      = module.baseline.schema_names.gold
+  reader_role_name      = module.baseline.role_names.reader
+  reader_warehouse_name = module.baseline.warehouse_names.reader
+}
