@@ -8,6 +8,7 @@ import pytest
 
 import edgar_warehouse.runtime as warehouse_runtime
 from edgar_warehouse.cli import main
+from edgar_warehouse.silver import SilverDatabase
 
 @pytest.fixture
 def workspace_tmp_dir():
@@ -33,6 +34,7 @@ def workspace_tmp_dir():
         ["catch-up-daily-form-index", "--help"],
         ["targeted-resync", "--help"],
         ["full-reconcile", "--help"],
+        ["seed-universe", "--help"],
     ],
 )
 def test_warehouse_cli_help(argv, capsys):
@@ -163,6 +165,81 @@ def test_gold_affecting_commands_require_snowflake_export_root(capsys, monkeypat
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "error"
     assert "SNOWFLAKE_EXPORT_ROOT" in payload["message"]
+
+
+@pytest.mark.fast
+def test_seed_universe_seeds_local_silver_database(capsys, workspace_tmp_dir):
+    warehouse_root = workspace_tmp_dir / "warehouse-root" / "warehouse"
+    source_file = workspace_tmp_dir / "company_tickers.json"
+    source_file.write_text(
+        json.dumps(
+            {
+                "0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."},
+                "1": {"cik_str": 789019, "ticker": "MSFT", "title": "Microsoft Corp."},
+                "2": {"cik_str": 1045810, "ticker": "NVDA", "title": "NVIDIA Corp."},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "seed-universe",
+            "--source-file",
+            str(source_file),
+            "--storage-root",
+            str(warehouse_root),
+            "--limit",
+            "2",
+            "--run-id",
+            "seed-universe-test-run",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["command"] == "seed-universe"
+    assert payload["rows_seeded"] == 2
+    assert payload["run_id"] == "seed-universe-test-run"
+    assert payload["tracked_universe_count"] == 2
+
+    db = SilverDatabase(str(warehouse_root / "silver" / "sec" / "silver.duckdb"))
+    ciks = sorted(db.get_tracked_universe_ciks(status_filter="active"))
+    assert ciks == [320193, 789019]
+
+
+@pytest.mark.fast
+def test_seed_universe_without_source_file_uses_sec_fallback(capsys, monkeypatch, workspace_tmp_dir):
+    warehouse_root = workspace_tmp_dir / "warehouse-root" / "warehouse"
+    exchange_payload = {
+        "0": {"cik_str": 320193, "ticker": "AAPL", "name": "Apple Inc.", "exchange": "Nasdaq"},
+        "1": {"cik_str": 789019, "ticker": "MSFT", "name": "Microsoft Corp.", "exchange": "Nasdaq"},
+    }
+
+    def fake_download(url: str, identity: str) -> bytes:
+        assert url.endswith("/files/company_tickers_exchange.json")
+        assert identity == "Warehouse Test warehouse-test@example.com"
+        return json.dumps(exchange_payload).encode("utf-8")
+
+    monkeypatch.setattr(warehouse_runtime, "_download_sec_bytes", fake_download)
+    monkeypatch.setenv("EDGAR_IDENTITY", "Warehouse Test warehouse-test@example.com")
+    monkeypatch.chdir(workspace_tmp_dir)
+
+    exit_code = main(
+        [
+            "seed-universe",
+            "--storage-root",
+            str(warehouse_root),
+            "--run-id",
+            "seed-universe-sec-fallback",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["source"].endswith("/files/company_tickers_exchange.json")
+    assert payload["rows_seeded"] == 2
+    assert payload["tracked_universe_count"] == 2
 
 
 @pytest.mark.fast

@@ -406,7 +406,25 @@ class SilverDatabase:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = duckdb.connect(db_path)
         self._conn.execute(_DDL)
-        self._conn.execute("ALTER TABLE sec_parse_run ADD COLUMN IF NOT EXISTS rows_written INTEGER")
+        self._ensure_schema_evolution()
+
+    def _ensure_schema_evolution(self) -> None:
+        migration_statements = [
+            "ALTER TABLE sec_tracked_universe ADD COLUMN IF NOT EXISTS input_ticker TEXT",
+            "ALTER TABLE sec_tracked_universe ADD COLUMN IF NOT EXISTS current_ticker TEXT",
+            "ALTER TABLE sec_tracked_universe ADD COLUMN IF NOT EXISTS universe_source TEXT",
+            "ALTER TABLE sec_tracked_universe ADD COLUMN IF NOT EXISTS tracking_status TEXT",
+            "ALTER TABLE sec_tracked_universe ADD COLUMN IF NOT EXISTS history_mode TEXT",
+            "ALTER TABLE sec_tracked_universe ADD COLUMN IF NOT EXISTS effective_from TIMESTAMPTZ",
+            "ALTER TABLE sec_tracked_universe ADD COLUMN IF NOT EXISTS effective_to TIMESTAMPTZ",
+            "ALTER TABLE sec_tracked_universe ADD COLUMN IF NOT EXISTS load_priority INTEGER",
+            "ALTER TABLE sec_tracked_universe ADD COLUMN IF NOT EXISTS scope_reason TEXT",
+            "ALTER TABLE sec_tracked_universe ADD COLUMN IF NOT EXISTS added_at TIMESTAMPTZ",
+            "ALTER TABLE sec_tracked_universe ADD COLUMN IF NOT EXISTS removed_at TIMESTAMPTZ",
+            "ALTER TABLE sec_parse_run ADD COLUMN IF NOT EXISTS rows_written INTEGER",
+        ]
+        for statement in migration_statements:
+            self._conn.execute(statement)
 
     def close(self) -> None:
         self._conn.close()
@@ -420,10 +438,18 @@ class SilverDatabase:
 
         Returns the number of rows inserted or updated.
         """
-        now = datetime.now(UTC)
         rows = _parse_company_ticker_rows(company_tickers_exchange)
+        return self.seed_tracked_universe_rows(rows)
+
+    def seed_tracked_universe_rows(self, rows: list[dict[str, Any]]) -> int:
+        """Upsert tracked-universe rows that were already parsed from SEC reference data."""
+        now = datetime.now(UTC)
         count = 0
         for row in rows:
+            cik = row.get("cik")
+            ticker = row.get("ticker")
+            if cik is None or not ticker:
+                continue
             self._conn.execute(
                 """
                 INSERT INTO sec_tracked_universe
@@ -432,9 +458,14 @@ class SilverDatabase:
                 VALUES (?, ?, ?, 'seeded_from_sec_reference', 'active', 'recent_only', ?, ?)
                 ON CONFLICT (cik) DO UPDATE SET
                     input_ticker = excluded.input_ticker,
-                    current_ticker = excluded.current_ticker
+                    current_ticker = excluded.current_ticker,
+                    universe_source = excluded.universe_source,
+                    tracking_status = excluded.tracking_status,
+                    history_mode = excluded.history_mode,
+                    effective_from = COALESCE(sec_tracked_universe.effective_from, excluded.effective_from),
+                    added_at = COALESCE(sec_tracked_universe.added_at, excluded.added_at)
                 """,
-                [row["cik"], row["ticker"], row["ticker"], now, now],
+                [int(cik), str(ticker), str(ticker), now, now],
             )
             count += 1
         return count

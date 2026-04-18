@@ -69,6 +69,13 @@ locals {
       warehouse_command_expression               = "States.Array('bootstrap-full', '--run-id', $$.Execution.Name)"
       warehouse_command_with_cik_list_expression = "States.Array('bootstrap-full', '--run-id', $$.Execution.Name, '--cik-list', $.cik_list)"
     }
+    seed_universe = {
+      task_profile                               = local.task_profile_by_workflow.seed_universe
+      schedule_expression                        = null
+      gold_affecting                             = false
+      warehouse_command_expression               = "States.Array('seed-universe', '--run-id', $$.Execution.Name)"
+      warehouse_command_with_cik_list_expression = null
+    }
     targeted_resync = {
       task_profile                               = local.task_profile_by_workflow.targeted_resync
       schedule_expression                        = null

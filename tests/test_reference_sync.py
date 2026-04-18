@@ -11,6 +11,7 @@ Ground-truth assertions from specification.md:
 """
 
 import pytest
+import duckdb
 from edgar_warehouse.silver import SilverDatabase
 from tests.warehouse_result_helpers import report_duckdb_table
 
@@ -128,3 +129,26 @@ def test_seed_tracked_universe_reports_table_summary(db):
 
     assert summary["table"] == "sec_tracked_universe"
     assert summary["row_count"] == 4
+
+
+@pytest.mark.fast
+def test_seed_tracked_universe_migrates_legacy_table_columns(tmp_path):
+    db_path = tmp_path / "silver.duckdb"
+    conn = duckdb.connect(str(db_path))
+    conn.execute(
+        """
+        CREATE TABLE sec_tracked_universe (
+            cik BIGINT PRIMARY KEY,
+            input_ticker TEXT
+        )
+        """
+    )
+    conn.close()
+
+    db = SilverDatabase(str(db_path))
+    db.seed_tracked_universe(_EXCHANGE_FIXTURE)
+
+    row = db.get_tracked_universe_entry(320193)
+    assert row is not None
+    assert row["current_ticker"] == "AAPL"
+    assert row["tracking_status"] == "active"

@@ -157,6 +157,57 @@ def run_command(command_name: str, args: Any) -> int:
     return 0
 
 
+def run_seed_universe_command(args: Any) -> int:
+    """Seed the tracked-universe table from a local SEC reference JSON file."""
+    try:
+        limit = _resolve_seed_limit(getattr(args, "limit", None))
+        silver_root = _resolve_seed_silver_root(args)
+        source_label, document = _resolve_seed_document(args)
+        rows = _parse_company_ticker_rows(document)
+        if not rows:
+            raise WarehouseRuntimeError(f"No company ticker rows found in {source_label}")
+        if limit is not None:
+            rows = rows[:limit]
+
+        db = _open_silver_database(StorageLocation(silver_root))
+        try:
+            rows_seeded = db.seed_tracked_universe_rows(rows)
+            tracked_universe_count = db.get_tracked_universe_count()
+        finally:
+            db.close()
+    except WarehouseRuntimeError as exc:
+        print(
+            json.dumps(
+                {
+                    "command": "seed-universe",
+                    "message": str(exc),
+                    "status": "error",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 2
+
+    print(
+        json.dumps(
+            {
+                "command": "seed-universe",
+                "limit": limit,
+                "rows_seeded": rows_seeded,
+                "run_id": getattr(args, "run_id", None),
+                "silver_db_path": str(Path(silver_root) / "silver" / "sec" / "silver.duckdb"),
+                "source": source_label,
+                "status": "ok",
+                "tracked_universe_count": tracked_universe_count,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def _build_warehouse_context(command_name: str) -> WarehouseCommandContext:
     identity = os.environ.get("EDGAR_IDENTITY", "").strip()
     if not identity:

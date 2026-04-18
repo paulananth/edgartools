@@ -19,6 +19,7 @@ Optional:
   --platform <platform>          Target platform (default: linux/amd64)
   --local-image <name>           Local image name for fallback mode
   --mode <auto|linux|crane>      Publish mode (default: auto)
+  --push-attempts <count>        Retry linux push this many times (default: 1)
   --output-file <path>           Write the final image reference with digest to a file
   --help                         Show this help
 
@@ -89,6 +90,8 @@ verify_image_in_ecr() {
 }
 
 publish_linux() {
+    local attempt sleep_seconds
+
     require_command docker
     require_command aws
 
@@ -98,14 +101,28 @@ publish_linux() {
     aws_cli ecr get-login-password \
         | docker login --username AWS --password-stdin "${REGISTRY}"
 
-    docker buildx build \
-        --platform "${PLATFORM}" \
-        --provenance=true \
-        --sbom=true \
-        --push \
-        --tag "${REMOTE_IMAGE_REF}" \
-        --file "${DOCKERFILE_PATH}" \
-        "${BUILD_CONTEXT}"
+    attempt=1
+    while true; do
+        if docker buildx build \
+            --platform "${PLATFORM}" \
+            --provenance=true \
+            --sbom=true \
+            --push \
+            --tag "${REMOTE_IMAGE_REF}" \
+            --file "${DOCKERFILE_PATH}" \
+            "${BUILD_CONTEXT}"; then
+            break
+        fi
+
+        if (( attempt >= PUSH_ATTEMPTS )); then
+            fail "linux publish failed after ${attempt} attempt(s)"
+        fi
+
+        sleep_seconds=$((attempt * 15))
+        echo "linux publish attempt ${attempt}/${PUSH_ATTEMPTS} failed; retrying in ${sleep_seconds}s" >&2
+        attempt=$((attempt + 1))
+        sleep "${sleep_seconds}"
+    done
 }
 
 publish_crane() {
@@ -150,6 +167,7 @@ BUILD_CONTEXT="."
 DOCKERFILE_PATH="Dockerfile"
 PLATFORM="linux/amd64"
 PUBLISH_MODE="auto"
+PUSH_ATTEMPTS=1
 OUTPUT_FILE=""
 LOCAL_IMAGE_NAME=""
 
@@ -187,6 +205,10 @@ while [[ $# -gt 0 ]]; do
             PUBLISH_MODE="$2"
             shift 2
             ;;
+        --push-attempts)
+            PUSH_ATTEMPTS="$2"
+            shift 2
+            ;;
         --output-file)
             OUTPUT_FILE="$2"
             shift 2
@@ -208,6 +230,7 @@ done
 [[ -n "${AWS_REGION}" ]] || fail "--aws-region is required"
 [[ -n "${ECR_REPOSITORY}" ]] || fail "--ecr-repository is required"
 [[ -n "${IMAGE_TAG}" ]] || fail "--image-tag is required"
+[[ "${PUSH_ATTEMPTS}" =~ ^[1-9][0-9]*$ ]] || fail "--push-attempts must be a positive integer"
 
 require_command aws
 

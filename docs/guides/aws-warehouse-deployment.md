@@ -135,9 +135,13 @@ For the current AWS runtime contract, that warehouse dependency set includes:
 - `httpx`
 - `duckdb`
 - `pyarrow`
+- `pytz`
 - `zstandard`
 - `fsspec`
 - `s3fs`
+
+`pytz` is required in the warehouse runtime because DuckDB's Python adapter needs it when
+materializing `TIMESTAMPTZ` values back into Python.
 
 The Docker build should copy only runtime-needed files such as `pyproject.toml`, `README.md`, `LICENSE.txt`, and `edgar/`, not the full repo tree.
 
@@ -170,6 +174,7 @@ CLI commands exposed by the container:
 - `daily-incremental`
 - `load-daily-form-index-for-date`
 - `catch-up-daily-form-index`
+- `seed-universe`
 - `targeted-resync`
 - `full-reconcile`
 
@@ -239,15 +244,46 @@ The ECR repository uses `image_tag_mutability = IMMUTABLE`. You cannot push a ta
 Recommended release policy:
 
 - Primary release path is Linux-first direct registry push from CI, CodeBuild, EC2, or WSL2
-- Windows Docker Desktop local publishing is fallback-only and should not be the normal release mechanism
+- On this Windows workstation, the only documented local publish path is the checked-in WSL wrapper
 - Build a single-platform Linux image for ECS/Fargate: `linux/amd64`
 - Keep provenance and SBOM enabled on the primary publish path so ECR can retain OCI referrers for the image
 - Use immutable tags such as the git SHA, then deploy ECS by digest after ECR verification
 - Keep ECR `scan_on_push` enabled and add Amazon ECR managed signing outside Terraform when the environment is ready for signature enforcement
 - The repository-standard publish helper is `infra/scripts/publish-warehouse-image.sh`
+- The repository-standard Windows wrapper is `infra/scripts/publish-warehouse-image-via-wsl.sh`
 - The reference CodeBuild entrypoint is `infra/codebuild/buildspec.publish-warehouse-image.yml`
 
-Primary Linux push flow:
+Operator note for this workspace:
+
+- the WSL bridge to `docker` and `aws` works
+- use the Linux-style `buildx --push` path through WSL for future publishes from this Windows machine
+- do not fall back to Windows `crane` or other local publish paths from this machine
+
+Canonical local Windows push flow:
+
+```bash
+GIT_SHA=$(git rev-parse --short HEAD)
+bash infra/scripts/publish-warehouse-image-via-wsl.sh \
+  --aws-profile <profile> \
+  --aws-region us-east-1 \
+  --ecr-repository edgartools-<env>-warehouse \
+  --image-tag "${GIT_SHA}" \
+  --output-file image-ref.txt
+```
+
+The WSL wrapper:
+
+- re-enters WSL so the publish runs as a Linux-style `buildx --push`
+- bridges to the installed Windows `docker.exe` and `aws.exe`
+- strips Windows CRLF from `aws.exe` output so ECR registry URLs stay valid
+- normalizes the inner publish helper to LF before execution so existing Windows checkouts do not trip over shell line endings
+- forces `--mode linux`
+- defaults to `--push-attempts 3` so transient ECR upload failures get retried on the same immutable tag before the command fails
+
+The helper performs the direct `buildx --push`, verifies the image in ECR, and writes the final
+digest reference to `image-ref.txt`.
+
+Primary native Linux push flow:
 
 ```bash
 GIT_SHA=$(git rev-parse --short HEAD)
@@ -260,56 +296,30 @@ bash infra/scripts/publish-warehouse-image.sh \
   --output-file image-ref.txt
 ```
 
-The helper performs the direct `buildx --push`, verifies the image in ECR, and writes the final
-digest reference to `image-ref.txt`. In Linux mode it bootstraps a `docker-container` buildx
-builder so provenance and SBOM attestations work in CI and CodeBuild.
+In Linux mode the helper bootstraps a `docker-container` buildx builder so provenance and SBOM
+attestations work in CI and CodeBuild.
 
 When using CodeBuild, configure the project to read this repository and point the buildspec at:
 
 `infra/codebuild/buildspec.publish-warehouse-image.yml`
 
-### Windows / Docker Desktop proxy workaround
+### Why the local publish has been brittle
 
 Docker Desktop on Windows routes registry traffic through an internal proxy (`192.168.65.1:3128`). In practice this makes ECR publication brittle for this image because the warehouse dependency set includes large layers, especially `pyarrow`. The usual failure mode is a mid-upload `broken pipe` or `connection reset` while publishing one large blob.
 
-Use `crane` (go-containerregistry) only as the Windows fallback path. Also export a single-platform tarball so the pushed artifact is as simple as possible.
+The WSL wrapper above is the documented local operator path because it removes the avoidable failure
+classes we saw in ad hoc attempts:
 
-Windows publishing flow:
-
-```bash
-# Install crane (one-time)
-curl -L "https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Windows_x86_64.tar.gz" \
-  -o /tmp/crane.tar.gz
-tar -xzf /tmp/crane.tar.gz -C /tmp/ crane.exe
-
-# Build a single-platform image without provenance attestations
-docker buildx build \
-  --platform linux/amd64 \
-  --provenance=false \
-  --sbom=false \
-  --load \
-  -t "edgartools-warehouse:${GIT_SHA}" .
-
-# Save only the ECS target platform to a tar file
-docker save \
-  --platform linux/amd64 \
-  "edgartools-warehouse:${GIT_SHA}" \
-  -o /tmp/edgartools-warehouse-amd64.tar
-
-# Authenticate once
-aws ecr get-login-password --region us-east-1 --profile <profile> \
-  | /tmp/crane.exe auth login -u AWS --password-stdin "<account-id>.dkr.ecr.us-east-1.amazonaws.com"
-
-# Push with crane
-/tmp/crane.exe push /tmp/edgartools-warehouse-amd64.tar "${ECR_URL}:${GIT_SHA}"
-```
-
-If `crane push` fails on a single remaining blob, rerun the same command. ECR keeps already-published blobs by digest, so retries usually continue from the remaining upload work instead of restarting from zero.
+1. CRLF shell scripts failing under WSL
+2. Windows `aws.exe` emitting `\r` into shell variables and breaking ECR URLs
+3. inconsistent one-off wrapper scripts under `.tmp/`
+4. manual retries not being encoded in the publish command itself
 
 Verification after push:
 
 ```bash
-CRANE_DIGEST=$(/tmp/crane.exe digest "${ECR_URL}:${GIT_SHA}")
+IMAGE_REF=$(cat image-ref.txt)
+echo "${IMAGE_REF}"
 aws ecr describe-images \
   --repository-name "edgartools-<env>-warehouse" \
   --region us-east-1 \
@@ -322,7 +332,7 @@ Only update `terraform.tfvars` after the image tag is visible in ECR and the dig
 After a successful push, update `container_image` in `terraform.tfvars` to the verified digest:
 
 ```bash
-# crane prints the digest after push, e.g.:
+# image-ref.txt contains the immutable digest reference, e.g.:
 # <ecr-url>@sha256:b7c361b843eb53b6c0afdd3ff9a03305c12ecc1619647f67a89211b648ead225
 # Use the @sha256:... form in terraform.tfvars for immutable production references.
 ```
@@ -347,8 +357,8 @@ The repeated local ECR publication failures observed on Windows were caused by:
 
 1. a large warehouse runtime layer, mainly from `pyarrow`
 2. Docker Desktop proxying registry uploads through an unstable local proxy path
-3. local release attempts relying on a Windows host instead of a Linux runner with direct `buildx --push`
-4. local BuildKit producing an OCI index with extra metadata unless provenance is disabled on the Windows fallback path
+3. running ad hoc local wrapper commands instead of one checked-in WSL bridge entrypoint
+4. CRLF shell files and CRLF `aws.exe` output crossing the Windows to WSL boundary
 5. cold redeploy sequencing not making image publication and digest verification an explicit gate before workflow execution
 
 ## Operator runbook
@@ -366,6 +376,7 @@ Manual workflows:
 
 - `bootstrap_recent_10`
 - `bootstrap_full`
+- `seed_universe`
 - `targeted_resync`
 - `full_reconcile`
 
@@ -402,6 +413,7 @@ Each state machine expects specific fields in the execution input JSON:
 | `bootstrap_full` | none required; optional `{"cik_list": "320193,789019,..."}` override |
 | `daily_incremental` | none required; optional `{"cik_list": "320193,789019,..."}` override |
 | `load_daily_form_index_for_date` | `{"target_date": "YYYY-MM-DD"}` |
+| `seed_universe` | none required |
 | `targeted_resync` | `{"scope_type": "<type>", "scope_key": "<key>"}` |
 | `catch_up_daily_form_index` | none required |
 | `full_reconcile` | none required |

@@ -83,6 +83,7 @@ warehouse = [
     "duckdb>=1.0.0",            # Canonical warehouse query engine
     "httpx>=0.25.0",            # SEC download client for bronze raw capture
     "pyarrow>=17.0.0",          # Parquet read/write support for warehouse storage
+    "pytz>=2024.1",             # DuckDB TIMESTAMPTZ materialization in Python
     "zstandard>=0.20.0",        # Compressed warehouse artifact handling
     "fsspec>=2023.1.0",         # Filesystem abstraction for local and object storage
 ]
