@@ -35,9 +35,27 @@ TMPDIR="${TEMP:-/tmp}"
 CIK_FILE="$TMPDIR/next_ciks_$$.txt"
 trap 'rm -f "$CIK_FILE"' EXIT
 
+# Find a Python interpreter that has snowflake-connector-python installed.
+PYTHON=""
+for candidate in python python3 \
+    "/c/Python314/python" "/c/Python313/python" "/c/Python312/python" \
+    "$LOCALAPPDATA/Programs/Python/Python314/python" \
+    "$LOCALAPPDATA/Programs/Python/Python313/python"; do
+  if "$candidate" -c "import snowflake.connector" 2>/dev/null; then
+    PYTHON="$candidate"
+    break
+  fi
+done
+if [[ -z "$PYTHON" ]]; then
+  echo "ERROR: no Python with snowflake-connector-python found."
+  echo "       Install with: pip install snowflake-connector-python"
+  exit 1
+fi
+echo ">> Using Python: $PYTHON"
+
 echo ">> Selecting next $BATCH_SIZE CIKs not yet loaded in $SNOWFLAKE_DATABASE.EDGARTOOLS_SOURCE.COMPANY"
 
-python - <<PY > "$CIK_FILE"
+"$PYTHON" - <<PY > "$CIK_FILE"
 import os, json, urllib.request, snowflake.connector
 
 conn = snowflake.connector.connect(
