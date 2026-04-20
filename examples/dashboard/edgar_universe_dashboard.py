@@ -1347,6 +1347,9 @@ def main() -> None:
     st.sidebar.caption("Streamlit over EDGARTOOLS_GOLD")
     section_name = st.sidebar.radio("Section", list(SECTIONS.keys()))
     st.sidebar.divider()
+    if st.sidebar.button("🔄 Refresh data", use_container_width=True):
+        q.clear()
+        st.rerun()
     st.sidebar.caption(f"Connection · {_cfg_summary()}")
     SECTIONS[section_name]()
 
