@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import csv
 import io
+import os
 import pathlib
 import tomllib
 from typing import Any
@@ -24,8 +25,8 @@ import snowflake.connector
 import streamlit as st
 
 
-DEFAULT_DATABASE = "EDGARTOOLS_DEV"
-DEFAULT_SCHEMA = "EDGARTOOLS_GOLD"
+DEFAULT_DATABASE = os.environ.get("EDGARTOOLS_DATABASE", "EDGARTOOLS")
+DEFAULT_SCHEMA = os.environ.get("EDGARTOOLS_SCHEMA", "EDGARTOOLS_GOLD")
 
 # Bind %s placeholders predictably regardless of any global user config.
 snowflake.connector.paramstyle = "pyformat"
