@@ -83,7 +83,7 @@ format (`json`). Confirm you are the admin:
 ```bash
 aws sts get-caller-identity
 # Expected: your admin user ARN, e.g.
-# arn:aws:iam::690839588395:user/admin-user
+# arn:aws:iam::<YOUR_AWS_ACCOUNT_ID>:user/admin-user
 ```
 
 ### Step 2 — Make the script executable
@@ -220,7 +220,7 @@ Type `yes` when prompted. This takes 2-4 minutes. Expected at the end:
 ```bash
 ECR_URL=$(terraform output -raw ecr_repository_url)
 echo "ECR: $ECR_URL"
-# e.g. 690839588395.dkr.ecr.us-east-1.amazonaws.com/edgartools-dev-warehouse
+# e.g. <YOUR_AWS_ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/edgartools-dev-warehouse
 ```
 
 ---
