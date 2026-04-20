@@ -16,18 +16,18 @@
 #   SNOWFLAKE_DATABASE  (default EDGARTOOLS_DEV)
 #   SNOWFLAKE_ROLE      (default ACCOUNTADMIN)
 #   SNOWFLAKE_WAREHOUSE (default COMPUTE_WH)
-#   STATE_MACHINE_ARN   (default arn:aws:states:us-east-1:690839588395:stateMachine:edgartools-dev-bootstrap-recent-10)
+#   STATE_MACHINE_ARN   (e.g. arn:aws:states:us-east-1:<your-aws-account-id>:stateMachine:edgartools-dev-bootstrap-recent-10)
 #   BATCH_SIZE          (default 100)
 
 set -euo pipefail
 
-export SNOWFLAKE_ACCOUNT="${SNOWFLAKE_ACCOUNT:=GAAGJGP-CKC59844}"
+export SNOWFLAKE_ACCOUNT="${SNOWFLAKE_ACCOUNT:?SNOWFLAKE_ACCOUNT must be set (e.g. ORGNAME-ACCOUNTNAME)}"
 export SNOWFLAKE_USER="${SNOWFLAKE_USER:?SNOWFLAKE_USER must be set}"
 export SNOWFLAKE_PASSWORD="${SNOWFLAKE_PASSWORD:?SNOWFLAKE_PASSWORD must be set}"
 export SNOWFLAKE_DATABASE="${SNOWFLAKE_DATABASE:=EDGARTOOLS_DEV}"
 export SNOWFLAKE_ROLE="${SNOWFLAKE_ROLE:=ACCOUNTADMIN}"
 export SNOWFLAKE_WAREHOUSE="${SNOWFLAKE_WAREHOUSE:=COMPUTE_WH}"
-export STATE_MACHINE_ARN="${STATE_MACHINE_ARN:=arn:aws:states:us-east-1:690839588395:stateMachine:edgartools-dev-bootstrap-recent-10}"
+export STATE_MACHINE_ARN="${STATE_MACHINE_ARN:?STATE_MACHINE_ARN must be set (e.g. arn:aws:states:<region>:<account-id>:stateMachine:edgartools-<env>-bootstrap-recent-10)}"
 export BATCH_SIZE="${BATCH_SIZE:=100}"
 export EDGAR_USER_AGENT="${EDGAR_USER_AGENT:=EdgarTools dev@example.com}"
 
@@ -106,5 +106,5 @@ MSYS_NO_PATHCONV=1 aws stepfunctions start-execution \
 echo ""
 echo ">> Monitor with:"
 echo "   aws stepfunctions describe-execution \\"
-echo "     --execution-arn arn:aws:states:us-east-1:690839588395:execution:edgartools-dev-bootstrap-recent-10:$RUN_ID \\"
+echo "     --execution-arn arn:aws:states:us-east-1:<your-aws-account-id>:execution:edgartools-dev-bootstrap-recent-10:$RUN_ID \\"
 echo "     --query 'status' --output text"
