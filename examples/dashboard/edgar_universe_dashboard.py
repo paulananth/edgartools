@@ -472,21 +472,6 @@ def get_conn() -> snowflake.connector.SnowflakeConnection:
     return snowflake.connector.connect(**kwargs)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def q(sql: str, params: tuple | None = None) -> pd.DataFrame:
-    conn = get_conn()
-    cur = conn.cursor()
-    try:
-        cur.execute(sql, params or ())
-        rows = cur.fetchall()
-        cols = [c[0] for c in cur.description]
-    finally:
-        cur.close()
-    df = pd.DataFrame(rows, columns=cols)
-    df.columns = df.columns.str.lower()
-    return df
-
-
 def is_missing_object_error(exc: BaseException) -> bool:
     """True when Snowflake reports a missing object or column: SQLSTATE 42S02/42000 / codes 002003, 000904."""
     msg = str(exc)
@@ -496,6 +481,38 @@ def is_missing_object_error(exc: BaseException) -> bool:
         or "invalid identifier" in msg
         or "000904" in msg
     )
+
+
+def is_auth_error(exc: BaseException) -> bool:
+    """True when the Snowflake session/token has expired (390114 / 08001)."""
+    msg = str(exc)
+    return "390114" in msg or "Authentication token has expired" in msg or "08001" in msg
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def q(sql: str, params: tuple | None = None) -> pd.DataFrame:
+    """Run SQL, auto-reconnecting once if the cached session token has expired."""
+    conn = get_conn()
+    for attempt in range(2):
+        cur = conn.cursor()
+        try:
+            cur.execute(sql, params or ())
+            rows = cur.fetchall()
+            cols = [c[0] for c in cur.description]
+        except Exception as exc:
+            cur.close()
+            if attempt == 0 and is_auth_error(exc):
+                get_conn.clear()
+                q.clear()
+                conn = get_conn()
+                continue
+            raise
+        else:
+            cur.close()
+        df = pd.DataFrame(rows, columns=cols)
+        df.columns = df.columns.str.lower()
+        return df
+    raise RuntimeError("unreachable")  # pragma: no cover
 
 
 def q_optional(sql: str, params: tuple | None = None) -> pd.DataFrame | None:
