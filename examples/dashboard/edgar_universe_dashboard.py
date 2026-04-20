@@ -770,11 +770,11 @@ def render_world_map() -> None:
         us_row = world.loc[world["country"] == "United States", "companies"]
         us_count = int(us_row.iloc[0]) if not us_row.empty else 0
         foreign_count = int(world.loc[world["country"] != "United States", "companies"].sum())
-        st.metric("Total companies (resolved)", f"{int(world['companies'].sum()):,}")
+        st.metric("Total companies", f"{total:,}")
         st.metric("US-incorporated", f"{us_count:,}")
         st.metric("Foreign-incorporated", f"{foreign_count:,}")
         if missing:
-            st.caption(f"⚠️ {int(missing):,} companies have missing/unrecognized place codes.")
+            st.caption(f"ℹ️ {int(missing):,} companies have no/unrecognized place code and are excluded from the map.")
 
     st.divider()
 
