@@ -36,6 +36,17 @@ const targetTables = {
   FILING_DETAIL: `${databaseName}.${sourceSchema}.FILING_DETAIL`
 };
 
+const mergeKeys = {
+  COMPANY: "COMPANY_KEY",
+  FILING_ACTIVITY: "FACT_KEY",
+  OWNERSHIP_ACTIVITY: "FACT_KEY",
+  OWNERSHIP_HOLDINGS: "FACT_KEY",
+  ADVISER_OFFICES: "FACT_KEY",
+  ADVISER_DISCLOSURES: "FACT_KEY",
+  PRIVATE_FUNDS: "FACT_KEY",
+  FILING_DETAIL: "FILING_KEY"
+};
+
 function q(value) {
   if (value === null || value === undefined) {
     return null;
@@ -185,7 +196,7 @@ try {
     exec(`
       COPY INTO ${tempTableName}
       FROM @${parquetStage}/${relativePath}
-      FILE_FORMAT = (FORMAT_NAME => ${parquetFileFormat})
+      FILE_FORMAT = (FORMAT_NAME = '${parquetFileFormat}')
       MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
     `);
 
@@ -198,10 +209,41 @@ try {
     totalRows += loadedRowCount;
   }
 
+  function getColumns(tableName) {
+    const rs = exec(`
+      SELECT COLUMN_NAME
+      FROM ${databaseName}.INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = '${sourceSchema}' AND TABLE_NAME = '${tableName}'
+      ORDER BY ORDINAL_POSITION
+    `);
+    const cols = [];
+    while (rs.next()) {
+      cols.push(rs.getColumnValue(1));
+    }
+    return cols;
+  }
+
   exec("BEGIN");
   for (const staged of stagedTables) {
-    exec(`TRUNCATE TABLE ${staged.targetTable}`);
-    exec(`INSERT INTO ${staged.targetTable} SELECT * FROM ${staged.tempTableName}`);
+    const key = mergeKeys[staged.tableName];
+    if (!key) {
+      throw new Error(`No merge key defined for table ${staged.tableName}`);
+    }
+    const columns = getColumns(staged.tableName);
+    if (columns.length === 0) {
+      throw new Error(`No columns found for table ${staged.tableName}`);
+    }
+    const updateSet = columns.filter(c => c !== key).map(c => `${c} = source.${c}`).join(", ");
+    const insertCols = columns.join(", ");
+    const insertVals = columns.map(c => `source.${c}`).join(", ");
+
+    exec(`
+      MERGE INTO ${staged.targetTable} AS target
+      USING ${staged.tempTableName} AS source
+      ON target.${key} = source.${key}
+      WHEN MATCHED THEN UPDATE SET ${updateSet}
+      WHEN NOT MATCHED THEN INSERT (${insertCols}) VALUES (${insertVals})
+    `);
   }
   exec("COMMIT");
 
