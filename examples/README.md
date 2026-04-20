@@ -51,6 +51,22 @@ Integrate EdgarTools with AI/LLM workflows:
 
 ---
 
+## 📊 Dashboards (`dashboard/`)
+
+Interactive Streamlit dashboards over the Snowflake gold layer
+(`EDGARTOOLS_DEV.EDGARTOOLS_GOLD`) produced by the dbt project under
+`infra/snowflake/dbt/edgartools_gold/`.
+
+- **[edgar_universe_dashboard.py](dashboard/edgar_universe_dashboard.py)** —
+  six-section explorer with a world map of companies by country of
+  incorporation, US state choropleth, industry/entity breakdowns, filing
+  activity trends, insider-transaction/AUM views, and a ticker/name lookup.
+
+See **[dashboard/README.md](dashboard/README.md)** for setup, the
+`~/.snowflake/config.toml` stanza, and launch command.
+
+---
+
 ## 📚 Additional Resources
 
 - **[docs/](../docs/)** - Full documentation
