@@ -6,7 +6,7 @@
 #     edgartools-dev-bootstrap-recent-10
 #   - Snowflake connector: pip install snowflake-connector-python
 #   - Env vars: SNOWFLAKE_USER, SNOWFLAKE_PASSWORD, SNOWFLAKE_ACCOUNT
-#              (defaults match the dev environment)
+#              (all three must be set; no defaults)
 #   - EDGAR_USER_AGENT (e.g. "Your Name your.email@example.com")
 #
 # Usage (from Git Bash):
@@ -103,8 +103,9 @@ MSYS_NO_PATHCONV=1 aws stepfunctions start-execution \
   --name "$RUN_ID" \
   --input "{\"cik_list\":\"$CIK_LIST\"}"
 
+_EXECUTION_ARN="${STATE_MACHINE_ARN/stateMachine:/execution:}:${RUN_ID}"
 echo ""
 echo ">> Monitor with:"
 echo "   aws stepfunctions describe-execution \\"
-echo "     --execution-arn arn:aws:states:us-east-1:<your-aws-account-id>:execution:edgartools-dev-bootstrap-recent-10:$RUN_ID \\"
+echo "     --execution-arn ${_EXECUTION_ARN} \\"
 echo "     --query 'status' --output text"
